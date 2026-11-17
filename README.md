@@ -19,6 +19,16 @@ Open the printed URL on the machine running PrintBench. HTTP binds only to `127.
 
 The dependency-free image runs as UID/GID 10001 and serves read-only HTTP on container loopback only. Supply a writable volume at `/data` for that identity; the startup command creates `/data/library` with mode `0700` on first boot. Keep CLI publishers on the same filesystem and UID; `--data /data/library` is the container library. The HTTP listener is not a publication transport. The image does not contain any library or demo artifacts.
 
+### Publish to GHCR
+
+The `Publish PrintBench image` workflow runs only on manual dispatch from `whzy1314/printbench` on `main`. It publishes the dispatched commit's `linux/amd64` image to `ghcr.io/whzy1314/printbench`, tagged with the full commit SHA. It reports the immutable tag-plus-digest reference; use that reference after verifying the private package and authorized pull path. Publishing does not deploy or grant registry pull access.
+
+### Helm chart
+
+`charts/printbench` deploys one loopback-only replica with a `ReadWriteOnce` claim; it creates no Service or Ingress. Supply `image` (reviewed `linux/amd64` image with `@sha256:…`) and `imagePullSecret` (name of a Secret already provisioned in the release namespace). Both are required. The namespace is assumed to exist unless `createNamespace` is set for a dedicated namespace. The claim uses the default StorageClass unless `storageClass.name` selects another one. To create a dedicated retained StorageClass, also supply `storageClass.provisioner` and any driver-specific `storageClass.parameters` as string values. Verify the provisioner, mount and data retention before use; the chart cannot check that the claim is bound or that credentials work.
+
+Offline chart tests require Helm and PyYAML: `python3 -m unittest discover -s tests/deployment -v`.
+
 ## Try a synthetic project
 
 Run from the checkout root. This uses a new disposable library, not your default library:

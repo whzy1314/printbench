@@ -1,0 +1,90 @@
+{{- $image := .Values.image }}
+{{- if not (kindIs "string" $image) }}
+{{- fail "An immutable PrintBench image reference must be a string" }}
+{{- end }}
+{{- $component := `[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*` }}
+{{- $reference := printf `^(%s(:[0-9]+)?/)?%s(/%s)*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?@sha256:[a-f0-9]{64}$` $component $component $component }}
+{{- if not (regexMatch $reference $image) }}
+{{- fail "An immutable PrintBench image reference with a sha256 digest is required" }}
+{{- end }}
+{{- $pullSecret := .Values.imagePullSecret }}
+{{- if not (kindIs "string" $pullSecret) }}
+{{- fail "The namespace-local pull Secret name must be a string" }}
+{{- end }}
+{{- $pullSecret = required "A provisioned namespace-local pull Secret name is required" $pullSecret }}
+{{- if or (gt (len $pullSecret) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $pullSecret)) }}
+{{- fail "The namespace-local pull Secret name must be a valid Kubernetes DNS subdomain" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name | quote }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name | quote }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: {{ $pullSecret | quote }}
+      containers:
+        - name: printbench
+          image: {{ $image | quote }}
+          imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: library
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os, urllib.request as u;
+                  os.close(os.open('/data/library', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW));
+                  u.urlopen(u.Request('http://127.0.0.1:8765/api/projects', method='HEAD'), timeout=3).close()
+            timeoutSeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import urllib.request as u;
+                  u.urlopen(u.Request('http://127.0.0.1:8765/', method='HEAD'), timeout=3).close()
+            timeoutSeconds: 5
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 512Mi}
+      volumes:
+        - name: library
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-library
