@@ -10,11 +10,10 @@ IMAGE = "registry.example:5000/tools/printbench:Test@sha256:" + "1" * 64  # Synt
 MAX_NAME = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61])
 
 
-def render(secret: object = "registry-pull", *, image: object = IMAGE,
-           release="bench", namespace="lab", **values):
+def render(*, image: object = IMAGE, release="bench", namespace="lab", **values):
     return subprocess.run(
         ["helm", "template", release, str(CHART), "--namespace", namespace, "-f", "-"],
-        input=yaml.safe_dump({"image": image, "imagePullSecret": secret, **values}),
+        input=yaml.safe_dump({"image": image, **values}),
         capture_output=True, text=True, timeout=15,
     )
 
@@ -23,16 +22,16 @@ class PullSecretTests(unittest.TestCase):
     def test_rejects_non_string_yaml_values(self):
         for value in ({"name": "synthetic"}, ["synthetic"], 123, True, None):
             with self.subTest(value=value):
-                result = render(value)
+                result = render(imagePullSecret=value)
                 self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
                 self.assertIn("pull Secret", result.stderr)
                 self.assertEqual(result.stdout, "")
 
     def test_rejects_invalid_names_without_trimming(self):
-        for value in ("", " ", " valid-name ", "valid-name\n", "Not A Secret Name",
+        for value in (" ", " valid-name ", "valid-name\n", "Not A Secret Name",
                       "a_b", "-abc", "abc-", "abc.-def", "a..b", "a.", MAX_NAME + "e"):
             with self.subTest(value=value):
-                result = render(value)
+                result = render(imagePullSecret=value)
                 self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
                 self.assertIn("pull Secret", result.stderr)
                 self.assertEqual(result.stdout, "")
@@ -40,7 +39,7 @@ class PullSecretTests(unittest.TestCase):
     def test_preserves_valid_names_as_strings(self):
         for value in ("pull-1", "registry.pull-1", "true", "123", MAX_NAME):
             with self.subTest(value=value):
-                result = render(value)
+                result = render(imagePullSecret=value)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 deployment, = (doc for doc in yaml.safe_load_all(result.stdout)
                                if doc and doc["kind"] == "Deployment")
@@ -53,6 +52,12 @@ class ChartTests(unittest.TestCase):
         result = render(**values)
         self.assertEqual(result.returncode, 0, result.stderr)
         return {doc["kind"]: doc for doc in yaml.safe_load_all(result.stdout)}
+
+    def test_omits_pull_secrets_when_unset_or_empty(self):
+        for values in ({}, {"imagePullSecret": ""}):
+            with self.subTest(values=values):
+                deployment = self.manifests(**values)["Deployment"]
+                self.assertNotIn("imagePullSecrets", deployment["spec"]["template"]["spec"])
 
     def test_generic_release_uses_default_storage_without_owning_namespace(self):
         docs = self.manifests()

@@ -21,11 +21,11 @@ The dependency-free image runs as UID/GID 10001 and serves read-only HTTP on con
 
 ### Publish to GHCR
 
-The `Publish PrintBench image` workflow runs only on manual dispatch from `whzy1314/printbench` on `main`. It publishes the dispatched commit's `linux/amd64` image to `ghcr.io/whzy1314/printbench`, tagged with the full commit SHA. It reports the immutable tag-plus-digest reference; use that reference after verifying the private package and authorized pull path. Publishing does not deploy or grant registry pull access.
+The `Publish PrintBench image` workflow runs only on manual dispatch from `whzy1314/printbench` on `main`. It publishes the dispatched commit's `linux/amd64` image to `ghcr.io/whzy1314/printbench`, tagged with the full commit SHA, using the Actions token. It reports the immutable tag-plus-digest reference. GHCR packages start private even for public source; the package owner sets visibility to Public separately. Verify an anonymous pull of the exact reference before using it. The workflow does not change visibility or deploy anything.
 
 ### Helm chart
 
-`charts/printbench` deploys one loopback-only replica with a `ReadWriteOnce` claim; it creates no Service or Ingress. Supply `image` (reviewed `linux/amd64` image with `@sha256:…`) and `imagePullSecret` (name of a Secret already provisioned in the release namespace). Both are required. The namespace is assumed to exist unless `createNamespace` is set for a dedicated namespace. The claim uses the default StorageClass unless `storageClass.name` selects another one. To create a dedicated retained StorageClass, also supply `storageClass.provisioner` and any driver-specific `storageClass.parameters` as string values. Verify the provisioner, mount and data retention before use; the chart cannot check that the claim is bound or that credentials work.
+`charts/printbench` deploys one loopback-only replica with a `ReadWriteOnce` claim; it creates no Service or Ingress. Supply `image` (reviewed `linux/amd64` image with `@sha256:…`). For a public image, omit `imagePullSecret` or set it to `""`; for a private image, supply the name of an existing pull Secret in the release namespace. The namespace is assumed to exist unless `createNamespace` is set for a dedicated namespace. The claim uses the default StorageClass unless `storageClass.name` selects another one. To create a dedicated retained StorageClass, also supply `storageClass.provisioner` and any driver-specific `storageClass.parameters` as string values. Verify the provisioner, mount and data retention before use; the chart cannot check that the claim is bound or that credentials work.
 
 Offline chart tests require Helm and PyYAML: `python3 -m unittest discover -s tests/deployment -v`.
 

@@ -8,11 +8,10 @@
 {{- fail "An immutable PrintBench image reference with a sha256 digest is required" }}
 {{- end }}
 {{- $pullSecret := .Values.imagePullSecret }}
-{{- if not (kindIs "string" $pullSecret) }}
+{{- if and (hasKey .Values "imagePullSecret") (not (kindIs "string" $pullSecret)) }}
 {{- fail "The namespace-local pull Secret name must be a string" }}
 {{- end }}
-{{- $pullSecret = required "A provisioned namespace-local pull Secret name is required" $pullSecret }}
-{{- if or (gt (len $pullSecret) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $pullSecret)) }}
+{{- if and $pullSecret (or (gt (len $pullSecret) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $pullSecret))) }}
 {{- fail "The namespace-local pull Secret name must be a valid Kubernetes DNS subdomain" }}
 {{- end }}
 apiVersion: apps/v1
@@ -45,8 +44,10 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
+      {{- if $pullSecret }}
       imagePullSecrets:
         - name: {{ $pullSecret | quote }}
+      {{- end }}
       containers:
         - name: printbench
           image: {{ $image | quote }}

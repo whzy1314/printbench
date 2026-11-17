@@ -1,5 +1,5 @@
 image: ""
-imagePullSecret: ""
+# Leave imagePullSecret unset by default so Helm does not coalesce an explicit null away.
 createNamespace: false
 storageClass:
   name: ""
