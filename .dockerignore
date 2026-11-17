@@ -1,0 +1,8 @@
+**
+!printbench/
+!printbench/*.py
+!web/
+!web/app.js
+!web/index.html
+!web/style.css
+!web/viewer.mjs

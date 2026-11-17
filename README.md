@@ -15,6 +15,10 @@ python3 -m printbench --data "$library" serve --port 8765
 
 Open the printed URL on the machine running PrintBench. HTTP binds only to `127.0.0.1` and is read-only, but is **not authenticated**: other local processes can read the artifacts and manifests, including recorded source paths. Do not expose this service through a LAN listener, public proxy, or port forward to untrusted users. If the port is busy, choose another port or use `--port 0` and read the assigned URL; do not stop an unrelated listener. Press Ctrl+C to stop the server you started.
 
+## Container
+
+The dependency-free image runs as UID/GID 10001 and serves read-only HTTP on container loopback only. Supply a writable volume at `/data` for that identity; the startup command creates `/data/library` with mode `0700` on first boot. Keep CLI publishers on the same filesystem and UID; `--data /data/library` is the container library. The HTTP listener is not a publication transport. The image does not contain any library or demo artifacts.
+
 ## Try a synthetic project
 
 Run from the checkout root. This uses a new disposable library, not your default library:
