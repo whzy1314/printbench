@@ -1,0 +1,9 @@
+{
+  "id": "sample",
+  "revision": "r1",
+  "name": "Synthetic download example",
+  "requirements": ["Store and retrieve a sample text artifact."],
+  "dimensions_mm": [1, 1, 1],
+  "notes": "Synthetic example only. Dimensions are placeholders; no model is included or checked.",
+  "artifacts": ["sample.txt"]
+}
