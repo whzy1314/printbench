@@ -68,7 +68,38 @@ class ChartTests(unittest.TestCase):
         self.assertEqual(claim["metadata"]["name"], "bench-library")
         pod = docs["Deployment"]["spec"]["template"]["spec"]
         self.assertEqual(pod["containers"][0]["image"], IMAGE)
+        self.assertNotIn("env", pod["containers"][0])
+        self.assertNotIn("ports", pod["containers"][0])
         self.assertEqual(pod["volumes"][0]["persistentVolumeClaim"]["claimName"], "bench-library")
+
+    def test_ingress_routes_one_host_to_its_release_without_changing_storage_or_probes(self):
+        default = self.manifests()
+        docs = self.manifests(ingressHost="bench.example")
+        self.assertEqual(set(docs), set(default) | {"Service", "Ingress"})
+        route = docs.pop("Ingress")["spec"]
+        self.assertEqual(route, {"ingressClassName": "traefik", "rules": [{
+            "host": "bench.example", "http": {"paths": [{"path": "/", "pathType": "Prefix",
+                "backend": {"service": {"name": "bench", "port": {"name": "http"}}}}]},
+        }]})
+        svc = docs.pop("Service")
+        self.assertEqual((svc["metadata"]["namespace"], svc["metadata"]["name"]), ("lab", "bench"))
+        selector = docs["Deployment"]["spec"]["selector"]["matchLabels"]
+        self.assertEqual(svc["spec"], {"type": "ClusterIP", "selector": selector,
+                                     "ports": [{"name": "http", "port": 80, "targetPort": "http"}]})
+        container = docs["Deployment"]["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container.pop("env"), [{"name": "PRINTBENCH_HOST", "value": "bench.example"}])
+        self.assertEqual(container.pop("ports"), [{"name": "http", "containerPort": 8765}])
+        self.assertEqual(docs, default)
+
+    def test_ingress_rejects_invalid_host_values(self):
+        for host in (None, True, [], {}, "", "*.example", "BENCH.example", "bench.example.",
+                     "bench.example:80", "127.0.0.1", "bench", "bench.-example",
+                     "a" * 64 + ".example", "bench.example\n", MAX_NAME + "e"):
+            with self.subTest(host=host):
+                result = render(ingressHost=host)
+                self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+                self.assertIn("ingressHost", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_yaml_like_names_stay_strings(self):
         docs = self.manifests(release="true", namespace="123", createNamespace=True)

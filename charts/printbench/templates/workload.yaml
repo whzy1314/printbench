@@ -14,6 +14,12 @@
 {{- if and $pullSecret (or (gt (len $pullSecret) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $pullSecret))) }}
 {{- fail "The namespace-local pull Secret name must be a valid Kubernetes DNS subdomain" }}
 {{- end }}
+{{- $ingressHost := .Values.ingressHost }}
+{{- if hasKey .Values "ingressHost" }}
+{{- if or (not (kindIs "string" $ingressHost)) (gt (len $ingressHost) 253) (not (regexMatch `^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` $ingressHost)) }}
+{{- fail "ingressHost must be a canonical lowercase DNS hostname without a port or trailing dot" }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,6 +58,14 @@ spec:
         - name: printbench
           image: {{ $image | quote }}
           imagePullPolicy: Always
+          {{- if $ingressHost }}
+          env:
+            - name: PRINTBENCH_HOST
+              value: {{ $ingressHost | quote }}
+          ports:
+            - name: http
+              containerPort: 8765
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -89,3 +103,38 @@ spec:
         - name: library
           persistentVolumeClaim:
             claimName: {{ .Release.Name }}-library
+{{- if $ingressHost }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ .Release.Name | quote }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: {{ $ingressHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name | quote }}
+                port:
+                  name: http
+{{- end }}

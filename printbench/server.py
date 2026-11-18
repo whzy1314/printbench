@@ -1,21 +1,25 @@
-"""Read-only, loopback-only HTTP surface; publication is a local CLI operation."""
+"""Read-only HTTP, loopback by default; publication is a local CLI operation."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import re
 from urllib.parse import unquote, urlsplit
 
 from .store import BenchError, directory, read_bytes
 
 WEB = Path(__file__).resolve().parent.parent / 'web'
+HOSTNAME = re.compile(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?')
 STATIC = {'/':('index.html','text/html; charset=utf-8'),
           '/app.js':('app.js','text/javascript; charset=utf-8'),
           '/viewer.mjs':('viewer.mjs','text/javascript; charset=utf-8'),
           '/style.css':('style.css','text/css; charset=utf-8')}
 
 
-def make_server(store, port=8765):
+def make_server(store, port=8765, *, host=None):
     if type(port) is not int or not 0 <= port <= 65535:
-        raise BenchError('Invalid loopback port')
+        raise BenchError('Invalid HTTP port')
+    if host is not None and (not isinstance(host, str) or len(host) > 253 or not HOSTNAME.fullmatch(host)):
+        raise BenchError('Expected a canonical lowercase DNS hostname without a port or trailing dot')
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, status, data, content_type='application/json; charset=utf-8', extra=None):
@@ -33,9 +37,12 @@ def make_server(store, port=8765):
                 self.wfile.write(data)
 
         def do_GET(self):
-            if self.headers.get('Host') not in {
-                    f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'}:
-                return self.reply(403,b'{"error":"Loopback Host required"}')
+            hosts = self.headers.get_all('Host')
+            port = self.server.server_port
+            canonical = host is not None and hosts == [host]
+            local = host is None or self.client_address[0] == '127.0.0.1'
+            if not (canonical or (local and hosts in ([f'127.0.0.1:{port}'], [f'localhost:{port}']))):
+                return self.reply(403,b'{"error":"Unexpected Host"}')
             try:
                 path = unquote(urlsplit(self.path).path, errors='strict')
                 if path in STATIC:
@@ -77,4 +84,4 @@ def make_server(store, port=8765):
         def log_message(self, format, *args):
             pass  # No artifact contents or untrusted paths in server logs.
 
-    return ThreadingHTTPServer(('127.0.0.1',port),Handler)
+    return ThreadingHTTPServer(('0.0.0.0' if host is not None else '127.0.0.1',port),Handler)

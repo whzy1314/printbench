@@ -13,11 +13,13 @@ python3 -m printbench --data "$library" serve --port 8765
 
 `--data` is a global option and goes before the command. It names the library directory, not this checkout or an artifact source. If omitted, it defaults to the path shown above. Prefer an explicit path, especially when writing. Use an owned directory with no symlink components. Listing a missing library returns an empty list; a successful first publish creates it. Serving an empty or missing library does not seed it.
 
-Open the printed URL on the machine running PrintBench. HTTP binds only to `127.0.0.1` and is read-only, but is **not authenticated**: other local processes can read the artifacts and manifests, including recorded source paths. Do not expose this service through a LAN listener, public proxy, or port forward to untrusted users. If the port is busy, choose another port or use `--port 0` and read the assigned URL; do not stop an unrelated listener. Press Ctrl+C to stop the server you started.
+Open the printed URL on the machine running PrintBench. HTTP binds to `127.0.0.1` by default and is read-only, but is **not authenticated**: other local processes can read the artifacts and manifests, including recorded source paths. If the port is busy, choose another port or use `--port 0` and read the assigned URL; do not stop an unrelated listener. Press Ctrl+C to stop the server you started.
 
 ## Container
 
-The dependency-free image runs as UID/GID 10001 and serves read-only HTTP on container loopback only. Supply a writable volume at `/data` for that identity; the startup command creates `/data/library` with mode `0700` on first boot. Keep CLI publishers on the same filesystem and UID; `--data /data/library` is the container library. The HTTP listener is not a publication transport. The image does not contain any library or demo artifacts.
+The dependency-free image runs as UID/GID 10001 and serves read-only HTTP on container loopback by default. Supply a writable volume at `/data` for that identity; the startup command creates `/data/library` with mode `0700` on first boot. Keep CLI publishers on the same filesystem and UID; `--data /data/library` is the container library. The HTTP listener is not a publication transport. The image does not contain any library or demo artifacts.
+
+For a trusted private proxy only, opt in with `serve --host bench.example` or set `PRINTBENCH_HOST=bench.example` (including in the container). This binds IPv4 `0.0.0.0`. Forward the exact configured lowercase DNS `Host` without a port; forwarded host headers are ignored. Loopback health probes still work. Host checking is not authentication: anyone who can reach the listener and send that Host can read artifacts and manifests. Do not expose it to untrusted clients.
 
 ### Publish to GHCR
 
@@ -25,7 +27,7 @@ The `Publish PrintBench image` workflow runs only on manual dispatch from `whzy1
 
 ### Helm chart
 
-`charts/printbench` deploys one loopback-only replica with a `ReadWriteOnce` claim; it creates no Service or Ingress. Supply `image` (reviewed `linux/amd64` image with `@sha256:…`). For a public image, omit `imagePullSecret` or set it to `""`; for a private image, supply the name of an existing pull Secret in the release namespace. The namespace is assumed to exist unless `createNamespace` is set for a dedicated namespace. The claim uses the default StorageClass unless `storageClass.name` selects another one. To create a dedicated retained StorageClass, also supply `storageClass.provisioner` and any driver-specific `storageClass.parameters` as string values. Verify the provisioner, mount and data retention before use; the chart cannot check that the claim is bound or that credentials work.
+`charts/printbench` deploys one loopback-only replica with a `ReadWriteOnce` claim by default; it creates no Service or Ingress. Set `ingressHost` to opt in to a ClusterIP Service and one host-specific Traefik Ingress. The chart does not provide TLS or network access restrictions; arrange those before exposing the route. Supply `image` (reviewed `linux/amd64` image with `@sha256:…`, built with host opt-in support when using ingress). For a public image, omit `imagePullSecret` or set it to `""`; for a private image, supply the name of an existing pull Secret in the release namespace. The namespace is assumed to exist unless `createNamespace` is set for a dedicated namespace. The claim uses the default StorageClass unless `storageClass.name` selects another one. To create a dedicated retained StorageClass, also supply `storageClass.provisioner` and any driver-specific `storageClass.parameters` as string values. Verify the provisioner, mount and data retention before use; the chart cannot check that the claim is bound or that credentials work.
 
 Offline chart tests require Helm and PyYAML: `python3 -m unittest discover -s tests/deployment -v`.
 
