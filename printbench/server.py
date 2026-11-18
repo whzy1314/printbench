@@ -42,9 +42,12 @@ class Handler(BaseHTTPRequestHandler):
         pass  # No artifact contents or untrusted paths in server logs.
 
 
-def make_server(store, port=8765, *, host=None, management_token_file=None, management_proof_file=None):
+def make_server(store, port=8765, *, host=None, management_token_file=None, management_proof_file=None,
+                shutdown_probe=False):
     bind = address(port, host)
     proof = management_proof_file is not None
+    if shutdown_probe and (proof or management_token_file is None):
+        raise BenchError('Management shutdown probe requires writer mode only')
     if proof and management_token_file is not None:
         raise BenchError('Proof mode and management writes are mutually exclusive')
 
@@ -98,5 +101,6 @@ def make_server(store, port=8765, *, host=None, management_token_file=None, mana
     if proof or management_token_file is not None:
         from .management import management_handler
         credential = management_proof_file if proof else management_token_file
-        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, credential, host=host, proof=proof))
+        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, credential, host=host,
+                                                            proof=proof, shutdown_probe=shutdown_probe))
     return ThreadingHTTPServer(bind, ReadHandler)

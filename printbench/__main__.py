@@ -20,8 +20,12 @@ def serve_library(store, args):
     if any(f"PRINTBENCH_MANAGEMENT_{key}" in os.environ
            for key in ("PORT", "HOST", "CERT_FILE", "KEY_FILE", "PROXY_CA_FILE")):
         raise BenchError("Obsolete management listener configuration; use the matching chart")
+    shutdown_probe = os.environ.get('PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE')
+    if shutdown_probe not in (None, '1'):
+        raise BenchError('Set the management shutdown probe opt-in to 1 or omit it')
     with make_server(store, args.port, host=args.host, management_token_file=args.management_token_file,
-                     management_proof_file=os.environ.get('PRINTBENCH_MANAGEMENT_PROOF_FILE')) as server:
+                     management_proof_file=os.environ.get('PRINTBENCH_MANAGEMENT_PROOF_FILE'),
+                     shutdown_probe=shutdown_probe == '1') as server:
         print(json.dumps({"url": f"http://127.0.0.1:{server.server_port}", "data": str(store.root)}), flush=True)
         server.serve_forever()
 

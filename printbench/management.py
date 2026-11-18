@@ -24,6 +24,7 @@ TOKEN = re.compile(rb'[a-f0-9]{64}\n?')
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_BODY = 4 + MAX_JSON + MAX_ARTIFACT_BYTES
 SOCKET_TIMEOUT = 10
+SHUTDOWN_WINDOW = 600
 
 
 @contextmanager
@@ -79,7 +80,7 @@ def unique_object(pairs):
     return result
 
 
-def management_handler(base: type[Handler], store, credential, *, host=None, proof=False):
+def management_handler(base: type[Handler], store, credential, *, host=None, proof=False, shutdown_probe=False):
     credential = Path(credential).absolute()
     try:
         read_token(credential, projection=True)
@@ -88,6 +89,9 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
             raise BenchError('Proof mode requires a valid protected sentinel file') from None
         raise BenchError('Management requires a valid protected credential file') from None
     slots = threading.BoundedSemaphore(2)
+    probe_lock = threading.Lock()
+    probe = None
+    owner_pid = os.getpid()
 
     class ManagementHandler(base):
         def parse_request(self):
@@ -119,18 +123,69 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                 raise RequestError(400, 'Duplicate header')
             return values[0] if values else None
 
-        def matches_credential(self):
+        def current_token(self):
             try:
-                token = read_token(credential, projection=True)
+                return read_token(credential, projection=True)
             except (OSError, BenchError):
                 raise RequestError(503, 'Management credential unavailable') from None
+
+        def bearer(self):
             auth = self.headers.get_all('Authorization')
-            return bool(auth and len(auth) == 1 and re.fullmatch(r'Bearer [a-f0-9]{64}', auth[0])
-                        and hmac.compare_digest(auth[0][7:], token))
+            if auth and len(auth) == 1 and re.fullmatch(r'Bearer [a-f0-9]{64}', auth[0]):
+                return auth[0][7:]
+
+        def matches_credential(self):
+            token, bearer = self.current_token(), self.bearer()
+            return bearer is not None and hmac.compare_digest(bearer, token)
 
         def denied(self, **headers):
             return self.result(401, {'error': 'Credential required'},
                                **{'WWW-Authenticate': 'Bearer realm="PrintBench"', **headers})
+
+        def bodyless_probe(self):
+            return (self.command == 'GET' and self.requestline.split()[1] == self.path
+                    and not self.headers.defects
+                    and self.headers.get_all('Content-Length') in (None, ['0'])
+                    and all(self.headers.get_all(name) is None for name in
+                            ('Transfer-Encoding', 'Content-Encoding', 'Expect'))
+                    and all('\r' not in value and '\n' not in value for _, value in self.headers.raw_items()))
+
+        def arm_shutdown(self, host, bearer):
+            nonlocal probe
+            if (os.getpid() == owner_pid and self.headers.get_all('X-PrintBench-Shutdown-Arm') == ['1']
+                    and self.bodyless_probe()):
+                with probe_lock:
+                    if probe is None:
+                        key = secrets.token_bytes(32)
+                        probe = (time.monotonic() + SHUTDOWN_WINDOW, host, self.path, key,
+                                 hmac.digest(key, bearer.encode('ascii'), 'sha256'))
+
+        def shutdown_denial(self, host, bearer, token):
+            nonlocal probe
+            if bearer is None or os.getpid() != owner_pid or not self.bodyless_probe():
+                return self.denied()
+            with probe_lock:
+                if probe and time.monotonic() >= probe[0]:
+                    probe = ()  # Expired; do not arm again in this process.
+                armed = probe
+            if not armed:
+                return self.denied()
+            expiry, probe_host, path, key, verifier = armed
+            if ((host, self.path) != (probe_host, path)
+                    or not hmac.compare_digest(verifier, hmac.digest(key, bearer.encode('ascii'), 'sha256'))
+                    or not slots.acquire(blocking=False)):
+                return self.denied()
+            try:
+                # With both permits held, no previously admitted handler can still commit.
+                try:
+                    fresh = self.current_token()
+                except RequestError:
+                    return self.denied()
+                if hmac.compare_digest(token, fresh) and time.monotonic() < expiry:
+                    return self.denied(**{'X-PrintBench-Shutdown-Receipt': secrets.token_hex(16)})
+                return self.denied()
+            finally:
+                slots.release()
 
         def take(self, length, deadline):
             chunks = bytearray()
@@ -181,10 +236,16 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                 hosts = self.headers.get_all('Host')
                 port = cast(HTTPServer, self.server).server_port
                 allowed = ([host],) if host is not None else ([f'127.0.0.1:{port}'], [f'localhost:{port}'])
-                if hosts not in allowed:
+                if hosts is None or hosts not in allowed:
                     raise RequestError(403, 'Unexpected Host')
-                if not proof and not self.matches_credential():
-                    return self.denied()
+                bearer = None
+                if not proof:
+                    token, bearer = self.current_token(), self.bearer()
+                    if bearer is None or not hmac.compare_digest(bearer, token):
+                        if shutdown_probe:
+                            return self.shutdown_denial(hosts[0], bearer, token)
+                        return self.denied()
+                    del token
                 route = ROUTE.fullmatch(self.path)
                 if route is None or self.requestline.split()[1] != self.path:
                     raise RequestError(404, 'Not found')
@@ -215,6 +276,8 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                     raise RequestError(400, 'Unexpected request body')
                 if action == 'state':
                     version, state = store.state(project)
+                    if shutdown_probe and bearer is not None:
+                        self.arm_shutdown(hosts[0], bearer)
                     return self.result(200, state, ETag=f'"{version}"')
                 match = self.header('If-Match')
                 absent = self.header('If-None-Match')
