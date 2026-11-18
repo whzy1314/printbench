@@ -24,14 +24,21 @@
 {{- $management := .Values.management }}
 {{- $proof := false }}
 {{- $secretName := "" }}
+{{- $shutdownProbe := false }}
 {{- if hasKey .Values "management" }}
-{{- if or (not (kindIs "map" $management)) (ne (len $management) 1) }}
+{{- if or (not (kindIs "map" $management)) (ne (len (omit $management "shutdownProbe")) 1) }}
 {{- fail "management requires exactly one of tokenSecret or proofSecret" }}
 {{- end }}
 {{- $proof = hasKey $management "proofSecret" }}
 {{- $secretName = ternary $management.proofSecret $management.tokenSecret $proof }}
 {{- if or (not (kindIs "string" $secretName)) (gt (len $secretName) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $secretName)) }}
 {{- fail "management requires a valid tokenSecret or proofSecret name" }}
+{{- end }}
+{{- if hasKey $management "shutdownProbe" }}
+{{- if or $proof (not (kindIs "bool" $management.shutdownProbe)) }}
+{{- fail "management.shutdownProbe must be a boolean and is only supported with tokenSecret" }}
+{{- end }}
+{{- $shutdownProbe = $management.shutdownProbe }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -82,6 +89,9 @@ spec:
             - {name: PRINTBENCH_MANAGEMENT_PROOF_FILE, value: /run/printbench/token/sentinel}
             {{- else if $management }}
             - {name: PRINTBENCH_MANAGEMENT_TOKEN_FILE, value: /run/printbench/token/token}
+            {{- if $shutdownProbe }}
+            - {name: PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE, value: "1"}
+            {{- end }}
             {{- end }}
           {{- end }}
           {{- if $ingressHost }}

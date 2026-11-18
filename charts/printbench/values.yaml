@@ -1,7 +1,8 @@
 image: ""
 # Leave imagePullSecret unset by default so Helm does not coalesce an explicit null away.
 # Omit ingressHost for loopback only; an exact DNS hostname opts in to Traefik ingress.
-# Omit management to disable it; opt in with only tokenSecret (writer) or proofSecret (non-writing).
+# Omit management to disable it; configure tokenSecret (writer) or proofSecret (non-writing).
+# Only with tokenSecret, set shutdownProbe: true under management to enable the writer shutdown probe.
 createNamespace: false
 storageClass:
   name: ""

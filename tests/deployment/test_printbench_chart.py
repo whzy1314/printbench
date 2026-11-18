@@ -119,6 +119,44 @@ class ChartTests(unittest.TestCase):
             'secretName': 'bench-token', 'defaultMode': 0o440, 'items': [{'key': 'token', 'path': 'token'}]}})
         self.assertEqual(docs, {(d['kind'], d['metadata']['name']):d for d in yaml.safe_load_all(plain.stdout)})
 
+    def test_shutdown_probe_adds_only_the_writer_env_flag(self):
+        writer = {'tokenSecret': 'bench-token'}
+        for values in ({}, {'ingressHost': 'bench.example'}):
+            with self.subTest(values=values):
+                base = self.manifests(management=writer, **values)
+                docs = self.manifests(management={**writer, 'shutdownProbe': True}, **values)
+                container = docs['Deployment']['spec']['template']['spec']['containers'][0]
+                self.assertEqual(container['env'].pop(), {
+                    'name': 'PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE', 'value': '1'})
+                self.assertEqual(docs, base)
+
+    def test_explicitly_disabled_shutdown_probe_preserves_writer_render(self):
+        writer = {'tokenSecret': 'bench-token'}
+        base = render(management=writer)
+        disabled = render(management={**writer, 'shutdownProbe': False})
+        self.assertEqual(base.returncode, 0, base.stderr)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertEqual(disabled.stdout, base.stdout)
+
+    def test_shutdown_probe_rejects_malformed_or_incompatible_management(self):
+        for override in (
+            *({'tokenSecret': 'bench-token', 'shutdownProbe': value}
+              for value in (None, '', 'true', 'false', 0, 1, [], {})),
+            *({'tokenSecret': value, 'shutdownProbe': True}
+              for value in (None, '', 'A/B', 'bench-token\n', 123, MAX_NAME + 'e')),
+            {'shutdownProbe': True},
+            {'shutdownProbe': False},
+            {'shutdownProbe': True, 'proofSecret': 'bench-proof'},
+            {'shutdownProbe': False, 'proofSecret': 'bench-proof'},
+            {'shutdownProbe': True, 'proofSecret': 'bench-proof', 'tokenSecret': 'bench-token'},
+            {'shutdownProbe': True, 'tokenSecret': 'bench-token', 'unknown': False},
+        ):
+            with self.subTest(override=override):
+                result = render(management=override)
+                self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('management', result.stderr)
+
     def test_proof_projects_only_the_sentinel_on_the_existing_workload(self):
         base = self.manifests(ingressHost='bench.example')
         docs = self.manifests(ingressHost='bench.example', management={'proofSecret': 'bench-proof'})
