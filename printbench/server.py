@@ -42,8 +42,11 @@ class Handler(BaseHTTPRequestHandler):
         pass  # No artifact contents or untrusted paths in server logs.
 
 
-def make_server(store, port=8765, *, host=None, management_token_file=None):
+def make_server(store, port=8765, *, host=None, management_token_file=None, management_proof_file=None):
     bind = address(port, host)
+    proof = management_proof_file is not None
+    if proof and management_token_file is not None:
+        raise BenchError('Proof mode and management writes are mutually exclusive')
 
     class ReadHandler(Handler):
 
@@ -92,7 +95,8 @@ def make_server(store, port=8765, *, host=None, management_token_file=None):
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_POST
 
-    if management_token_file is not None:
+    if proof or management_token_file is not None:
         from .management import management_handler
-        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, management_token_file, host=host))
+        credential = management_proof_file if proof else management_token_file
+        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, credential, host=host, proof=proof))
     return ThreadingHTTPServer(bind, ReadHandler)

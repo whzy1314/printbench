@@ -22,13 +22,16 @@
 {{- end }}
 {{- end }}
 {{- $management := .Values.management }}
+{{- $proof := false }}
+{{- $secretName := "" }}
 {{- if hasKey .Values "management" }}
 {{- if or (not (kindIs "map" $management)) (ne (len $management) 1) }}
-{{- fail "management requires only tokenSecret" }}
+{{- fail "management requires exactly one of tokenSecret or proofSecret" }}
 {{- end }}
-{{- $name := $management.tokenSecret }}
-{{- if or (not (kindIs "string" $name)) (gt (len $name) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $name)) }}
-{{- fail "management requires a valid tokenSecret name" }}
+{{- $proof = hasKey $management "proofSecret" }}
+{{- $secretName = ternary $management.proofSecret $management.tokenSecret $proof }}
+{{- if or (not (kindIs "string" $secretName)) (gt (len $secretName) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $secretName)) }}
+{{- fail "management requires a valid tokenSecret or proofSecret name" }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -75,7 +78,9 @@ spec:
             - name: PRINTBENCH_HOST
               value: {{ $ingressHost | quote }}
             {{- end }}
-            {{- if $management }}
+            {{- if $proof }}
+            - {name: PRINTBENCH_MANAGEMENT_PROOF_FILE, value: /run/printbench/token/sentinel}
+            {{- else if $management }}
             - {name: PRINTBENCH_MANAGEMENT_TOKEN_FILE, value: /run/printbench/token/token}
             {{- end }}
           {{- end }}
@@ -127,10 +132,14 @@ spec:
         {{- if $management }}
         - name: management-token
           secret:
-            secretName: {{ $management.tokenSecret | quote }}
+            secretName: {{ $secretName | quote }}
             defaultMode: 288 # 0440
             items:
+              {{- if $proof }}
+              - {key: sentinel, path: sentinel}
+              {{- else }}
               - {key: token, path: token}
+              {{- end }}
         {{- end }}
 {{- if $ingressHost }}
 ---

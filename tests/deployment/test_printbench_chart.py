@@ -119,6 +119,32 @@ class ChartTests(unittest.TestCase):
             'secretName': 'bench-token', 'defaultMode': 0o440, 'items': [{'key': 'token', 'path': 'token'}]}})
         self.assertEqual(docs, {(d['kind'], d['metadata']['name']):d for d in yaml.safe_load_all(plain.stdout)})
 
+    def test_proof_projects_only_the_sentinel_on_the_existing_workload(self):
+        base = self.manifests(ingressHost='bench.example')
+        docs = self.manifests(ingressHost='bench.example', management={'proofSecret': 'bench-proof'})
+        pod = docs['Deployment']['spec']['template']['spec']
+        container = pod['containers'][0]
+        self.assertEqual(container['env'].pop(), {'name': 'PRINTBENCH_MANAGEMENT_PROOF_FILE',
+                         'value': '/run/printbench/token/sentinel'})
+        self.assertEqual(container['volumeMounts'].pop(), {'name': 'management-token',
+                         'mountPath': '/run/printbench/token', 'readOnly': True})
+        self.assertEqual(pod['volumes'].pop(), {'name': 'management-token', 'secret': {
+            'secretName': 'bench-proof', 'defaultMode': 0o440,
+            'items': [{'key': 'sentinel', 'path': 'sentinel'}]}})
+        self.assertEqual(docs, base)
+
+    def test_proof_rejects_mixed_unknown_or_malformed_opt_in(self):
+        for override in ({'proofSecret': 'probe', 'tokenSecret': 'writer'},
+                         {'proofSecret': 'probe', 'tokenSecret': None},
+                         {'proofSecret': 'probe', 'enabled': False}, {'proofsecret': 'probe'},
+                         *({'proofSecret': value} for value in
+                           (None, False, [], {}, 123, '', 'Probe', 'a/b', 'probe\n', MAX_NAME + 'e'))):
+            with self.subTest(override=override):
+                result = render(management=override, ingressHost='bench.example')
+                self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('management', result.stderr)
+
     def test_management_refuses_missing_or_malformed_values(self):
         for override in (None, False, {}, {'host': 'bench.example'}, {'tokenSecret': ''},
                          {'tokenSecret': 'A/B'}, {'tokenSecret': None}, {'tokenSecret': 123},

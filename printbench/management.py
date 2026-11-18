@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import threading
 import time
@@ -78,11 +79,13 @@ def unique_object(pairs):
     return result
 
 
-def management_handler(base: type[Handler], store, credential, *, host=None):
+def management_handler(base: type[Handler], store, credential, *, host=None, proof=False):
     credential = Path(credential).absolute()
     try:
         read_token(credential, projection=True)
     except (OSError, BenchError):
+        if proof:
+            raise BenchError('Proof mode requires a valid protected sentinel file') from None
         raise BenchError('Management requires a valid protected credential file') from None
     slots = threading.BoundedSemaphore(2)
 
@@ -116,7 +119,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None):
                 raise RequestError(400, 'Duplicate header')
             return values[0] if values else None
 
-        def authenticated(self):
+        def matches_credential(self):
             try:
                 token = read_token(credential, projection=True)
             except (OSError, BenchError):
@@ -124,6 +127,10 @@ def management_handler(base: type[Handler], store, credential, *, host=None):
             auth = self.headers.get_all('Authorization')
             return bool(auth and len(auth) == 1 and re.fullmatch(r'Bearer [a-f0-9]{64}', auth[0])
                         and hmac.compare_digest(auth[0][7:], token))
+
+        def denied(self, **headers):
+            return self.result(401, {'error': 'Credential required'},
+                               **{'WWW-Authenticate': 'Bearer realm="PrintBench"', **headers})
 
         def take(self, length, deadline):
             chunks = bytearray()
@@ -176,9 +183,8 @@ def management_handler(base: type[Handler], store, credential, *, host=None):
                 allowed = ([host],) if host is not None else ([f'127.0.0.1:{port}'], [f'localhost:{port}'])
                 if hosts not in allowed:
                     raise RequestError(403, 'Unexpected Host')
-                if not self.authenticated():
-                    return self.result(401, {'error': 'Credential required'},
-                                       **{'WWW-Authenticate': 'Bearer realm="PrintBench"'})
+                if not proof and not self.matches_credential():
+                    return self.denied()
                 route = ROUTE.fullmatch(self.path)
                 if route is None or self.requestline.split()[1] != self.path:
                     raise RequestError(404, 'Not found')
@@ -192,6 +198,16 @@ def management_handler(base: type[Handler], store, credential, *, host=None):
                 if length is not None and length > MAX_BODY:
                     raise RequestError(413, 'Upload too large')
                 project, action = route.groups()
+                if proof:
+                    if action != 'state' or self.command != 'GET':
+                        raise RequestError(403, 'Only the state probe is enabled')
+                    if length not in (None, 0) or any('\r' in value or '\n' in value
+                                                      for _, value in self.headers.raw_items()):
+                        raise RequestError(400, 'Expected an unambiguous bodyless state probe')
+                    if self.matches_credential():
+                        # Correlate to this response without reflecting request data.
+                        return self.denied(**{'X-PrintBench-Proof-Receipt': secrets.token_hex(16)})
+                    return self.denied()
                 allowed_method = {None: 'PUT', 'state': 'GET', 'archive': 'POST', 'restore': 'POST'}[action]
                 if self.command != allowed_method:
                     return self.result(405, {'error': 'Method not allowed'}, Allow=allowed_method)
@@ -212,7 +228,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None):
                     raise RequestError(400, 'Invalid project precondition')
                 if action is None:
                     spec, content = self.upload(length, project)
-                    if not self.authenticated():
+                    if not self.matches_credential():
                         raise RequestError(401, 'Credential changed during upload')
                     manifest = store._publish(spec, content, 'PrintBench management API', expected=expected)
                     return self.result(201, manifest)
