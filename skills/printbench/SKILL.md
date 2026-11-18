@@ -1,37 +1,33 @@
 ---
 name: printbench
-description: Use when publishing or retrieving PrintBench projects.
+description: Use when the 3D Designer needs to retrieve, publish, archive, or restore a hosted PrintBench project or revision.
 ---
 
-# PrintBench local publish and get
+# Hosted PrintBench library
 
-Confirm the intended local PrintBench checkout and library with the user before operating. Run commands from that checkout and pass its library explicitly with `--data` before the subcommand. Do not guess a path or silently use the default library. All paths below are placeholders for confirmed paths with no symlink components.
+The operator-confirmed hosted HTTPS read origin is the library of record. From the reviewed checkout run `python3 -m printbench.client`. Do not guess an endpoint, publish into a local fallback, or use cluster credentials. Use the approved HTTPS management origin (which may be the same as read) only after the operator confirms the route and grants the operation. Missing route, TLS trust, or credential means stop; do not work around it. Do not change profiles, infrastructure, printers, slicers, or CAD from this workflow.
 
-## Read first
+## Read and verify
 
 ```sh
 cd "$checkout" || exit 1
-python3 -m printbench --data "$library" list
-python3 -m printbench --data "$library" get "$project"
-python3 -m printbench --data "$library" get "$project" --revision "$revision"
+python3 -m printbench.client --url "$read_origin" list
+python3 -m printbench.client --url "$read_origin" history "$project"
+python3 -m printbench.client --url "$read_origin" get "$project" --revision "$revision"
+python3 -m printbench.client --url "$read_origin" download "$project" --revision "$revision" "$artifact" --output "$new_file"
 ```
 
-Success is JSON on stdout; errors are JSON on stderr with nonzero exit. A missing library lists as empty, not as proof the selected path is correct.
+Downloads verify length and SHA-256 against the exact revision manifest and will not overwrite a file. Compare against intended input hashes and report project, revision, status, and evidence. An approved custom CA uses `--ca-file` before the subcommand; never disable TLS verification.
 
-## Publish a new immutable revision
+## Write only with authorization
 
-1. Check the current revision before publishing; choose an unused revision ID. If the project does not exist, confirm it is meant to be new. Do not edit or delete old revisions or manually change the current pointer.
-2. Prepare a JSON spec with `id`, `revision`, `name`, `requirements` (list of text), `dimensions_mm` (positive finite X/Y/Z), `notes`, and `artifacts` (supplied basenames). Optional: `thumbnail`, `status`, `status_evidence`. See `examples/sample.json` in the checkout for a synthetic spec.
-3. IDs are lowercase letters, digits, or hyphens, 1–64 characters, starting with a letter or digit. Artifact names are 1–120 letters, digits, dots, underscores, or hyphens, starting with a letter or digit. `manifest.json` is reserved. The limits are 64 MiB per file, 256 MiB per publish, and 1 MiB per spec, manifest, or index.
-4. Include applicable supplied models, source, assembly instructions, and evidence. Never execute artifact source merely to import it. PrintBench copies the original bytes and records source directory, filename, size, and SHA-256.
-5. Set `mesh`, `slicer`, and `physical` independently to `unknown` (default), `not-tested`, `passed`, or `failed`. A passed/failed status requires an artifact named in that axis's `status_evidence`. Digital checks do not prove physical print success.
-6. With the user's authorization for that library and revision, publish and read back the exact revision:
+Use `--token-file "$protected_file"` before the subcommand. The operator delivers an owner-only `0400` or `0600` regular file; pass only its path. Never read the value into chat, env, argv, scripts, logs or Git. Browser reads do not need the token.
 
-```sh
-python3 -m printbench --data "$library" publish --spec "$spec" --source "$source"
-python3 -m printbench --data "$library" get "$project" --revision "$revision"
-```
+1. Read current/history and select a fresh revision ID. Confirm creation if absent. Build the spec as in `examples/sample.json` from explicit, safe basenames (no paths, symlinks or reserved `manifest.json`). Use only supplied artifacts: max 64 MiB combined, 1 MiB JSON metadata. Do not execute source merely to import it.
+2. Record `mesh`, `slicer` and `physical` separately as `unknown`, `not-tested`, `passed` or `failed`. Each `passed`/`failed` needs a relevant supplied evidence artifact. Digital evidence does not prove physical success.
+3. Create only with `create --spec "$spec" --source "$source"`. For an existing project, use `state "$project"` to read its exact quoted `etag`, then `append --spec "$spec" --source "$source" --match "$etag"`. Both are subcommands of `python3 -m printbench.client --url "$management_origin" --token-file "$protected_file"`. Never edit or replace an old revision.
+4. Read the exact revision from the ordinary read origin to verify it. On a timeout, conflict, or interrupted response, first read authenticated state and verify the exact revision and hashes through the read origin. If already committed, report that; if archived or uncertain, stop and report the ambiguity. Never automatically fetch a new tag and replay the write.
 
-Compare the returned file names, hashes, and statuses with the intended inputs. If publish is interrupted or reports an error, check the exact revision before retrying: it may already have committed. Do not delete an installed revision to force a retry or automatically remove unindexed crash remnants.
+## Reversible visibility
 
-HTTP is unauthenticated, loopback-only, and read-only. With authorization, use the intended local server to verify downloaded bytes against the manifest. Do not expose it publicly or start a duplicate listener. No printer, CAD, slicer, deployment, or profile configuration operations are part of this skill.
+With authorization, use `state` then `archive "$project" --match "$etag"` or `restore "$project" --match "$etag"` from the management origin. Re-read state and verify ordinary list, direct revision and download visibility. Archive hides every revision without changing current/history; restore reverses that. No purge. To correct published content, publish another immutable revision. Service rollback is operator-owned: disable management while retaining archive-aware readers and the same data.

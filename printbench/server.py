@@ -1,4 +1,4 @@
-"""Read-only HTTP, loopback by default; publication is a local CLI operation."""
+"""Read-only browser HTTP, loopback by default."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -15,26 +15,37 @@ STATIC = {'/':('index.html','text/html; charset=utf-8'),
           '/style.css':('style.css','text/css; charset=utf-8')}
 
 
-def make_server(store, port=8765, *, host=None):
+def address(port, host):
     if type(port) is not int or not 0 <= port <= 65535:
         raise BenchError('Invalid HTTP port')
     if host is not None and (not isinstance(host, str) or len(host) > 253 or not HOSTNAME.fullmatch(host)):
         raise BenchError('Expected a canonical lowercase DNS hostname without a port or trailing dot')
+    return '0.0.0.0' if host is not None else '127.0.0.1', port
 
-    class Handler(BaseHTTPRequestHandler):
-        def reply(self, status, data, content_type='application/json; charset=utf-8', extra=None):
-            self.send_response(status)
-            self.send_header('Content-Type',content_type)
-            self.send_header('Content-Length',str(len(data)))
-            self.send_header('Cache-Control','no-store')
-            self.send_header('X-Content-Type-Options','nosniff')
-            self.send_header('Referrer-Policy','no-referrer')
-            self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
-            for key,value in (extra or {}).items():
-                self.send_header(key,value)
-            self.end_headers()
-            if self.command != 'HEAD':
-                self.wfile.write(data)
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, status, data, content_type='application/json; charset=utf-8', extra=None):
+        self.send_response(status)
+        self.send_header('Content-Type',content_type)
+        self.send_header('Content-Length',str(len(data)))
+        self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('Referrer-Policy','no-referrer')
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+        for key,value in (extra or {}).items():
+            self.send_header(key,value)
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(data)
+
+    def log_message(self, format, *args):
+        pass  # No artifact contents or untrusted paths in server logs.
+
+
+def make_server(store, port=8765, *, host=None):
+    bind = address(port, host)
+
+    class ReadHandler(Handler):
 
         def do_GET(self):
             hosts = self.headers.get_all('Host')
@@ -81,7 +92,4 @@ def make_server(store, port=8765, *, host=None):
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_POST
 
-        def log_message(self, format, *args):
-            pass  # No artifact contents or untrusted paths in server logs.
-
-    return ThreadingHTTPServer(('0.0.0.0' if host is not None else '127.0.0.1',port),Handler)
+    return ThreadingHTTPServer(bind, ReadHandler)

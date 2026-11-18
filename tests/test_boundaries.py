@@ -153,11 +153,12 @@ class BoundaryTests(unittest.TestCase):
         # A small shared cap reaches the genuine index-growth boundary with real revisions.
         with patch('printbench.store.MAX_JSON', 1024, create=True):
             self.store.publish(self.spec, self.source)
-            history = {'schema':1, 'id':'tile', 'current':'r1', 'revisions':['r1']}
+            history = {'schema':1, 'id':'tile', 'current':'r1', 'revisions':['r1'],
+                       'version':'0' * 32, 'archived':False}
             for i in range(30):
                 revision = f'r{i:03d}-' + 'x' * 59
                 next_index = dict(history, current=revision, revisions=[*history['revisions'], revision])
-                size = len((json.dumps(next_index, indent=2) + '\n').encode())
+                size = len((json.dumps(next_index, separators=(',', ':')) + '\n').encode())
                 before = disk_state(self.store.root)
                 if size > 1024:
                     with self.assertRaises(BenchError):

@@ -1,6 +1,7 @@
 image: ""
 # Leave imagePullSecret unset by default so Helm does not coalesce an explicit null away.
 # Omit ingressHost for loopback only; an exact DNS hostname opts in to Traefik ingress.
+# Omit management to disable it; opt-in requires host, tokenSecret, tlsSecret (see README).
 createNamespace: false
 storageClass:
   name: ""

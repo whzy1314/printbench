@@ -16,9 +16,15 @@ FILENAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z')
 MAX_FILE = 64 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
 MAX_JSON = 1024 * 1024
+VERSION = re.compile(r'[a-f0-9]{32}')
+LEGACY_VERSION = '0' * 32
 
 
 class BenchError(ValueError):
+    pass
+
+
+class StateChanged(BenchError):
     pass
 
 
@@ -96,11 +102,25 @@ def write_bytes(fd, name, data):
         os.fsync(stream.fileno())
 
 
-def encoded(value):
-    data = (json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + '\n').encode()
+def encoded(value, *, compact=False):
+    data = (json.dumps(value, indent=None if compact else 2, separators=(',', ':') if compact else None,
+                       ensure_ascii=False, allow_nan=False) + '\n').encode()
     if len(data) > MAX_JSON:
         raise BenchError('Serialized JSON exceeds reader size limit')
     return data
+
+
+def replace_index(pfd, data):
+    pointer = '.pointer-' + uuid.uuid4().hex
+    try:
+        write_bytes(pfd, pointer, data)
+        os.replace(pointer, 'project.json', src_dir_fd=pfd, dst_dir_fd=pfd)
+    finally:
+        try:
+            os.unlink(pointer, dir_fd=pfd)
+        except FileNotFoundError:
+            pass
+    os.fsync(pfd)
 
 
 def validate_spec(spec):
@@ -152,6 +172,12 @@ class Store:
     def __init__(self, root):
         self.root = Path(os.path.abspath(root))
 
+    @contextmanager
+    def _locked(self, *, write=False, create=False):
+        with directory(self.root, create=create) as root:
+            fcntl.flock(root, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+            yield root
+
     def _index(self, pfd, project):
         index = read_json(pfd, 'project.json')
         if not isinstance(index, dict) or index.get('schema') != 1 or index.get('id') != project:
@@ -163,70 +189,102 @@ class Store:
             identifier(rev)
         if len(set(revisions)) != len(revisions) or index.get('current') not in revisions:
             raise BenchError('Invalid current revision pointer')
+        if 'version' not in index and 'archived' not in index:
+            index.update(version=LEGACY_VERSION, archived=False)
+        if (type(index.get('archived')) is not bool or not isinstance(index.get('version'), str)
+                or not VERSION.fullmatch(index['version'])):
+            raise BenchError('Invalid project visibility state')
         return index
+
+    def _visible_index(self, pfd, project):
+        index = self._index(pfd, project)
+        if index['archived']:
+            raise FileNotFoundError('Project not found')
+        return index
+
+    def state(self, project):
+        identifier(project)
+        with self._locked() as root, child_directory(root, project) as pfd:
+            index = self._index(pfd, project)
+            return index['version'], {key:index[key] for key in ('current','archived')}
+
+    def set_archived(self, project, archived, expected):
+        identifier(project)
+        with self._locked(write=True) as root, child_directory(root, project) as pfd:
+            index = self._index(pfd, project)
+            if index['version'] != expected:
+                raise StateChanged('Project state changed')
+            if index['archived'] == archived:
+                raise BenchError('Project is already in that state')
+            index.update(version=uuid.uuid4().hex, archived=archived)
+            replace_index(pfd, encoded(index, compact=True))
+            return index['version'], {key:index[key] for key in ('current','archived')}
 
     def history(self, project):
         identifier(project)
-        with directory(self.root) as root, child_directory(root, project) as pfd:
-            index = self._index(pfd, project)
+        with self._locked() as root, child_directory(root, project) as pfd:
+            index = self._visible_index(pfd, project)
             return {key:index[key] for key in ('current','revisions')}
 
     def get(self, project, revision=None):
         identifier(project)
         if revision is not None:
             identifier(revision)
-        with directory(self.root) as root, child_directory(root, project) as pfd:
-            index = self._index(pfd, project)
-            revision = revision or index['current']
-            if revision not in index['revisions']:
-                raise BenchError('Revision is not published')
-            with child_directory(pfd, 'revisions') as revs, child_directory(revs, revision) as rfd:
-                result = read_json(rfd, 'manifest.json')
-            if not isinstance(result, dict) or result.get('id') != project or result.get('revision') != revision:
-                raise BenchError('Invalid revision identity')
-            artifacts = result.get('artifacts')
-            if not isinstance(artifacts, list) or not artifacts:
-                raise BenchError('Invalid artifact manifest')
-            for a in artifacts:
-                if not isinstance(a, dict):
-                    raise BenchError('Invalid artifact entry')
-                filename(a.get('name'))
-                if not isinstance(a.get('sha256'),str) or not re.fullmatch('[a-f0-9]{64}',a['sha256']):
-                    raise BenchError('Invalid artifact hash')
-                if type(a.get('bytes')) is not int or not 0 <= a['bytes'] <= MAX_FILE:
-                    raise BenchError('Invalid artifact size')
-            return result
+        with self._locked() as root, child_directory(root, project) as pfd:
+            return self._manifest(pfd, project, self._visible_index(pfd, project), revision)
+
+    def _manifest(self, pfd, project, index, revision=None):
+        revision = revision or index['current']
+        if revision not in index['revisions']:
+            raise BenchError('Revision is not published')
+        with child_directory(pfd, 'revisions') as revs, child_directory(revs, revision) as rfd:
+            result = read_json(rfd, 'manifest.json')
+        if not isinstance(result, dict) or result.get('id') != project or result.get('revision') != revision:
+            raise BenchError('Invalid revision identity')
+        artifacts = result.get('artifacts')
+        if not isinstance(artifacts, list) or not artifacts:
+            raise BenchError('Invalid artifact manifest')
+        for a in artifacts:
+            if not isinstance(a, dict):
+                raise BenchError('Invalid artifact entry')
+            filename(a.get('name'))
+            if not isinstance(a.get('sha256'),str) or not re.fullmatch('[a-f0-9]{64}',a['sha256']):
+                raise BenchError('Invalid artifact hash')
+            if type(a.get('bytes')) is not int or not 0 <= a['bytes'] <= MAX_FILE:
+                raise BenchError('Invalid artifact size')
+        return result
 
     def list(self):
         if not self.root.exists() and not self.root.is_symlink():
             return []
         projects = []
-        with directory(self.root) as root:
+        with self._locked() as root:
             for project in sorted(os.listdir(root)):
                 with child_directory(root, identifier(project)) as pfd:
                     try:
-                        self._index(pfd, project)
+                        index = self._visible_index(pfd, project)
                     except FileNotFoundError:
                         continue  # A first publish may still be staging, or have failed.
-                projects.append(project)
-        return [self.get(project) for project in projects]
+                    projects.append(self._manifest(pfd, project, index))
+        return projects
 
     def artifact(self, project, revision, name):
+        identifier(project)
+        identifier(revision)
         filename(name)
-        manifest = self.get(project, revision)
-        entry = next((a for a in manifest['artifacts'] if a['name'] == name), None)
-        if entry is None:
-            raise BenchError('Artifact is not published')
-        with directory(self.root) as root, child_directory(root, project) as pfd, \
-                child_directory(pfd, 'revisions') as revs, child_directory(revs, revision) as rfd:
-            data = read_bytes(rfd, name)
+        with self._locked() as root, child_directory(root, project) as pfd:
+            manifest = self._manifest(pfd, project, self._visible_index(pfd, project), revision)
+            entry = next((a for a in manifest['artifacts'] if a['name'] == name), None)
+            if entry is None:
+                raise BenchError('Artifact is not published')
+            with child_directory(pfd, 'revisions') as revs, child_directory(revs, revision) as rfd:
+                data = read_bytes(rfd, name)
         if len(data) != entry['bytes'] or hashlib.sha256(data).hexdigest() != entry['sha256']:
             raise BenchError('Artifact integrity check failed')
         return data, entry
 
     def publish(self, spec, source):
         validate_spec(spec)
-        project, revision = spec['id'], spec['revision']
         # Open/read sources before creating anything in the store.
         content = {}
         with directory(source) as sfd:
@@ -234,27 +292,39 @@ class Store:
                 content[name] = read_bytes(sfd, name)
                 if sum(map(len, content.values())) > MAX_TOTAL:
                     raise BenchError('Total artifacts exceed 256 MiB')
+        return self._publish(spec, content, os.path.abspath(source))
+
+    def _publish(self, spec, content, source, *, expected=None):
+        project, revision = spec['id'], spec['revision']
         manifest = {key:value for key,value in spec.items() if key != 'artifacts'}
         manifest['schema'] = 1
         manifest['status'] = dict.fromkeys(('mesh','slicer','physical'), 'unknown') | spec.get('status', {})
         manifest['status_evidence'] = spec.get('status_evidence', {})
         manifest['artifacts'] = [
             {'name':name, 'bytes':len(data), 'sha256':hashlib.sha256(data).hexdigest(),
-             'provenance':{'source_directory':os.path.abspath(source), 'source_name':name}}
+             'provenance':{'source_directory':source, 'source_name':name}}
             for name,data in content.items()]
         manifest_bytes = encoded(manifest)
-        with directory(self.root, create=True) as root:
-            fcntl.flock(root, fcntl.LOCK_EX)
-            with child_directory(root, project, create=True) as pfd:
+        create = expected in (None, '*')
+        with self._locked(write=True, create=create) as root:
+            with child_directory(root, project, create=create) as pfd:
                 try:
                     index = self._index(pfd, project)
                 except FileNotFoundError:
-                    index = {'schema':1,'id':project,'current':None,'revisions':[]}
+                    if not create:
+                        raise StateChanged('Project state changed') from None
+                    index = {'schema':1,'id':project,'current':None,'revisions':[], 'archived':False}
+                if (expected == '*' and index['revisions']) or (
+                        not create and index['version'] != expected):
+                    raise StateChanged('Project state changed')
+                if index['archived']:
+                    raise BenchError('Archived project must be restored before publication')
                 if revision in index['revisions']:
                     raise BenchError('Duplicate revision; publish a new revision ID')
                 index['revisions'].append(revision)
                 index['current'] = revision
-                index_bytes = encoded(index)
+                index['version'] = uuid.uuid4().hex
+                index_bytes = encoded(index, compact=True)
                 with child_directory(pfd, 'revisions', create=True) as revs:
                     try:
                         os.stat(revision, dir_fd=revs, follow_symlinks=False)
@@ -263,7 +333,6 @@ class Store:
                     else:
                         raise BenchError('Revision path already exists (possibly an unpublished orphan)')
                     stage = '.stage-' + uuid.uuid4().hex
-                    pointer = '.pointer-' + uuid.uuid4().hex
                     installed = committed = False
                     os.mkdir(stage, mode=0o700, dir_fd=revs)
                     try:
@@ -275,10 +344,8 @@ class Store:
                         os.rename(stage, revision, src_dir_fd=revs, dst_dir_fd=revs)
                         installed = True
                         os.fsync(revs)
-                        write_bytes(pfd, pointer, index_bytes)
-                        os.replace(pointer, 'project.json', src_dir_fd=pfd, dst_dir_fd=pfd)
+                        replace_index(pfd, index_bytes)
                         committed = True
-                        os.fsync(pfd)
                         os.fsync(root)
                     finally:
                         if installed and not committed:
@@ -291,8 +358,5 @@ class Store:
                             shutil.rmtree(revision, dir_fd=revs)
                         elif not installed:
                             shutil.rmtree(stage, dir_fd=revs)
-                        try:
-                            os.unlink(pointer, dir_fd=pfd)
-                        except FileNotFoundError:
-                            pass
+
         return manifest
