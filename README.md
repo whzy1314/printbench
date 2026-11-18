@@ -31,6 +31,8 @@ The `Publish PrintBench image` workflow runs only on manual dispatch from `whzy1
 
 Offline chart tests require Helm and PyYAML: `python3 -m unittest discover -s tests/deployment -v`.
 
+For Helm CLI upgrades, use `helm upgrade RELEASE ./charts/printbench --reset-values -f desired-values.yaml` with the **complete desired values**, including the image and every override to retain. Do not use `--reuse-values` or `--reset-then-reuse-values` for these security settings. In Helm 3.18.3, `--reuse-values` can discard an explicit `null` and retain the previous `management.shutdownProbe` or `management.tokenSecret` before the chart can validate it. Argo CD renders fresh from the full declarative values, not from Helm release history. For either supported path, omit `management` to disable management entirely, or keep `tokenSecret` and omit `shutdownProbe` (or set it to `false`) to disable only the probe. `null` is not a disable value.
+
 ## Optional private management API
 
 Management is disabled unless explicitly configured. It uses `/manage/v1/` on the existing HTTP listener and shares the existing store and locks. Opt in with `serve --management-token-file FILE` or `PRINTBENCH_MANAGEMENT_TOKEN_FILE` (path only). Use synthetic credentials for isolated loopback tests. The server checks the actual Host and authenticates every management operation with the bearer before processing a body, including on direct requests. Forwarded headers never establish identity, authorization, or transport security. The old separate-listener settings must not be reused.
