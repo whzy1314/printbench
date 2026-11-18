@@ -17,7 +17,6 @@ MAX_FILE = 64 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
 MAX_JSON = 1024 * 1024
 VERSION = re.compile(r'[a-f0-9]{32}')
-LEGACY_VERSION = '0' * 32
 
 
 class BenchError(ValueError):
@@ -86,11 +85,20 @@ def read_bytes(fd, name, limit=MAX_FILE):
         return data
 
 
-def read_json(fd, name):
+def decode_json(data):
     try:
-        return json.loads(read_bytes(fd, name, MAX_JSON))
+        return json.loads(data)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise BenchError('Invalid JSON manifest') from exc
+
+
+def read_json(fd, name):
+    return decode_json(read_bytes(fd, name, MAX_JSON))
+
+
+def state_tag(data):
+    # The committed bytes include project identity, full state and (on writes) a fresh nonce.
+    return hashlib.sha256(data).hexdigest()[:32]
 
 
 def write_bytes(fd, name, data):
@@ -173,13 +181,15 @@ class Store:
         self.root = Path(os.path.abspath(root))
 
     @contextmanager
-    def _locked(self, *, write=False, create=False):
+    def _writer(self, *, create=False):
         with directory(self.root, create=create) as root:
-            fcntl.flock(root, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+            fcntl.flock(root, fcntl.LOCK_EX)
             yield root
 
     def _index(self, pfd, project):
-        index = read_json(pfd, 'project.json')
+        # Atomic replacement leaves an already-open fd on one complete index snapshot.
+        data = read_bytes(pfd, 'project.json', MAX_JSON)
+        index = decode_json(data)
         if not isinstance(index, dict) or index.get('schema') != 1 or index.get('id') != project:
             raise BenchError('Invalid project index')
         revisions = index.get('revisions')
@@ -190,39 +200,40 @@ class Store:
         if len(set(revisions)) != len(revisions) or index.get('current') not in revisions:
             raise BenchError('Invalid current revision pointer')
         if 'version' not in index and 'archived' not in index:
-            index.update(version=LEGACY_VERSION, archived=False)
-        if (type(index.get('archived')) is not bool or not isinstance(index.get('version'), str)
+            index['archived'] = False
+        elif (type(index.get('archived')) is not bool or not isinstance(index.get('version'), str)
                 or not VERSION.fullmatch(index['version'])):
             raise BenchError('Invalid project visibility state')
-        return index
+        return index, data
 
     def _visible_index(self, pfd, project):
-        index = self._index(pfd, project)
+        index, _ = self._index(pfd, project)
         if index['archived']:
             raise FileNotFoundError('Project not found')
         return index
 
     def state(self, project):
         identifier(project)
-        with self._locked() as root, child_directory(root, project) as pfd:
-            index = self._index(pfd, project)
-            return index['version'], {key:index[key] for key in ('current','archived')}
+        with directory(self.root) as root, child_directory(root, project) as pfd:
+            index, data = self._index(pfd, project)
+            return state_tag(data), {key:index[key] for key in ('current','archived')}
 
     def set_archived(self, project, archived, expected):
         identifier(project)
-        with self._locked(write=True) as root, child_directory(root, project) as pfd:
-            index = self._index(pfd, project)
-            if index['version'] != expected:
+        with self._writer() as root, child_directory(root, project) as pfd:
+            index, data = self._index(pfd, project)
+            if state_tag(data) != expected:
                 raise StateChanged('Project state changed')
             if index['archived'] == archived:
                 raise BenchError('Project is already in that state')
             index.update(version=uuid.uuid4().hex, archived=archived)
-            replace_index(pfd, encoded(index, compact=True))
-            return index['version'], {key:index[key] for key in ('current','archived')}
+            data = encoded(index, compact=True)
+            replace_index(pfd, data)
+            return state_tag(data), {key:index[key] for key in ('current','archived')}
 
     def history(self, project):
         identifier(project)
-        with self._locked() as root, child_directory(root, project) as pfd:
+        with directory(self.root) as root, child_directory(root, project) as pfd:
             index = self._visible_index(pfd, project)
             return {key:index[key] for key in ('current','revisions')}
 
@@ -230,7 +241,7 @@ class Store:
         identifier(project)
         if revision is not None:
             identifier(revision)
-        with self._locked() as root, child_directory(root, project) as pfd:
+        with directory(self.root) as root, child_directory(root, project) as pfd:
             return self._manifest(pfd, project, self._visible_index(pfd, project), revision)
 
     def _manifest(self, pfd, project, index, revision=None):
@@ -258,7 +269,7 @@ class Store:
         if not self.root.exists() and not self.root.is_symlink():
             return []
         projects = []
-        with self._locked() as root:
+        with directory(self.root) as root:
             for project in sorted(os.listdir(root)):
                 with child_directory(root, identifier(project)) as pfd:
                     try:
@@ -272,7 +283,7 @@ class Store:
         identifier(project)
         identifier(revision)
         filename(name)
-        with self._locked() as root, child_directory(root, project) as pfd:
+        with directory(self.root) as root, child_directory(root, project) as pfd:
             manifest = self._manifest(pfd, project, self._visible_index(pfd, project), revision)
             entry = next((a for a in manifest['artifacts'] if a['name'] == name), None)
             if entry is None:
@@ -306,17 +317,17 @@ class Store:
             for name,data in content.items()]
         manifest_bytes = encoded(manifest)
         create = expected in (None, '*')
-        with self._locked(write=True, create=create) as root:
+        with self._writer(create=create) as root:
             with child_directory(root, project, create=create) as pfd:
                 try:
-                    index = self._index(pfd, project)
+                    index, data = self._index(pfd, project)
                 except FileNotFoundError:
                     if not create:
                         raise StateChanged('Project state changed') from None
                     index = {'schema':1,'id':project,'current':None,'revisions':[], 'archived':False}
-                if (expected == '*' and index['revisions']) or (
-                        not create and index['version'] != expected):
-                    raise StateChanged('Project state changed')
+                else:
+                    if expected == '*' or (expected is not None and state_tag(data) != expected):
+                        raise StateChanged('Project state changed')
                 if index['archived']:
                     raise BenchError('Archived project must be restored before publication')
                 if revision in index['revisions']:
@@ -350,7 +361,8 @@ class Store:
                     finally:
                         if installed and not committed:
                             try:
-                                committed = revision in self._index(pfd, project)['revisions']
+                                index, _ = self._index(pfd, project)
+                                committed = revision in index['revisions']
                             except FileNotFoundError:
                                 pass
                             # If index reconciliation itself fails, retain the revision.

@@ -19,7 +19,8 @@ from .store import (BenchError, MAX_FILE, MAX_JSON, VERSION, StateChanged,
 PREFIX = '/manage/v1/projects/'
 ROUTE = re.compile(PREFIX + r'([a-z0-9][a-z0-9-]{0,63})(?:/(state|archive|restore))?')
 TOKEN = re.compile(rb'[a-f0-9]{64}\n?')
-MAX_BODY = 4 + MAX_JSON + MAX_FILE  # Management aggregate limit is 64 MiB.
+MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_BODY = 4 + MAX_JSON + MAX_ARTIFACT_BYTES
 SOCKET_TIMEOUT = 10
 
 
@@ -185,6 +186,8 @@ def make_management_server(store, port, credential, *, host=None, tls=None):
                     raise ValueError('Invalid file lengths')
             except (ValueError, RecursionError):
                 raise RequestError(400, 'Invalid upload metadata or file lengths') from None
+            if sum(sizes) > MAX_ARTIFACT_BYTES:
+                raise RequestError(413, 'Total artifacts exceed 64 MiB')
             return spec, {name:self.take(size, deadline) for name, size in zip(names, sizes)}
 
         def manage(self):

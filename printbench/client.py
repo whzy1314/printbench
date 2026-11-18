@@ -9,7 +9,7 @@ import sys
 from urllib.parse import urlsplit
 
 from .__main__ import Parser
-from .management import PREFIX, read_token
+from .management import MAX_ARTIFACT_BYTES, PREFIX, read_token
 from .store import (BenchError, MAX_FILE, MAX_JSON, VERSION, directory, filename,
                     identifier, read_bytes, read_json, validate_spec, write_bytes)
 
@@ -54,7 +54,7 @@ def upload(args):
     total = 0
     with directory(args.source) as source:
         for name in spec['artifacts']:
-            data = read_bytes(source, name, MAX_FILE - total)
+            data = read_bytes(source, name, min(MAX_FILE, MAX_ARTIFACT_BYTES - total))
             total += len(data)
             files.append(data)
     meta = json.dumps({'spec': spec, 'sizes': list(map(len, files))}, ensure_ascii=False, allow_nan=False).encode()
