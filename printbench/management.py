@@ -1,22 +1,23 @@
-"""Bounded, authenticated management protocol. Never mount on the read handler."""
+"""Bounded, authenticated management protocol, separate from browser routes."""
 from contextlib import contextmanager
 import hmac
-from http.server import ThreadingHTTPServer
+from http.server import HTTPServer
 import json
 import os
 from pathlib import Path
 import re
-import ssl
 import stat
 import threading
 import time
+from typing import cast
 import unicodedata
 
-from .server import Handler, address
+from .server import Handler
 from .store import (BenchError, MAX_FILE, MAX_JSON, VERSION, StateChanged,
                     child_directory, directory, validate_spec)
 
-PREFIX = '/manage/v1/projects/'
+MANAGEMENT_ROOT = '/manage/v1/'
+PREFIX = MANAGEMENT_ROOT + 'projects/'
 ROUTE = re.compile(PREFIX + r'([a-z0-9][a-z0-9-]{0,63})(?:/(state|archive|restore))?')
 TOKEN = re.compile(rb'[a-f0-9]{64}\n?')
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
@@ -77,53 +78,31 @@ def unique_object(pairs):
     return result
 
 
-class LimitedServer(ThreadingHTTPServer):
-    def __init__(self, bind, handler):
-        self.slots = threading.BoundedSemaphore(2)
-        super().__init__(bind, handler)
-
-    def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self.slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.slots.release()
-
-    def handle_error(self, request, client_address):
-        # Connection failures and tracebacks must not echo request data or credentials.
-        pass
-
-
-def make_management_server(store, port, credential, *, host=None, tls=None):
-    bind = address(port, host)
-    if host is not None and (tls is None or tls.verify_mode != ssl.CERT_REQUIRED):
-        raise BenchError('Network management requires TLS with proxy client authentication')
+def management_handler(base: type[Handler], store, credential, *, host=None):
     credential = Path(credential).absolute()
+    try:
+        read_token(credential, projection=True)
+    except (OSError, BenchError):
+        raise BenchError('Management requires a valid protected credential file') from None
+    slots = threading.BoundedSemaphore(2)
 
-    class ManagementHandler(Handler):
-        timeout = SOCKET_TIMEOUT
-
-        def setup(self):
-            if tls is not None:
-                self.request.settimeout(self.timeout)
-                self.request = tls.wrap_socket(self.request, server_side=True)
-            super().setup()
-
-        def finish(self):
+    class ManagementHandler(base):
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            if not self.path.startswith(MANAGEMENT_ROOT):
+                return True
+            # Dispatch all methods here so unknown methods cannot bypass management auth.
+            self.close_connection = True
+            self.connection.settimeout(SOCKET_TIMEOUT)
+            if not slots.acquire(blocking=False):
+                self.result(503, {'error': 'Management busy'})
+                return False
             try:
-                super().finish()
+                self.manage()
             finally:
-                if tls is not None:
-                    self.request.close()
+                slots.release()
+            return False
 
         def send_error(self, code, message=None, explain=None):
             self.result(code, {'error': 'Unsupported or malformed HTTP request'})
@@ -140,7 +119,7 @@ def make_management_server(store, port, credential, *, host=None, tls=None):
         def authenticated(self):
             try:
                 token = read_token(credential, projection=True)
-            except OSError:
+            except (OSError, BenchError):
                 raise RequestError(503, 'Management credential unavailable') from None
             auth = self.headers.get_all('Authorization')
             return bool(auth and len(auth) == 1 and re.fullmatch(r'Bearer [a-f0-9]{64}', auth[0])
@@ -157,7 +136,7 @@ def make_management_server(store, port, credential, *, host=None, tls=None):
                 if not chunk:
                     raise RequestError(400, 'Incomplete upload')
                 chunks.extend(chunk)
-            self.connection.settimeout(self.timeout)
+            self.connection.settimeout(SOCKET_TIMEOUT)
             return chunks
 
         def upload(self, length, project):
@@ -191,19 +170,18 @@ def make_management_server(store, port, credential, *, host=None, tls=None):
             return spec, {name:self.take(size, deadline) for name, size in zip(names, sizes)}
 
         def manage(self):
-            self.close_connection = True
             try:
                 hosts = self.headers.get_all('Host')
-                port = listener.server_port
+                port = cast(HTTPServer, self.server).server_port
                 allowed = ([host],) if host is not None else ([f'127.0.0.1:{port}'], [f'localhost:{port}'])
                 if hosts not in allowed:
                     raise RequestError(403, 'Unexpected Host')
-                route = ROUTE.fullmatch(self.path)
-                if route is None or self.requestline.split()[1] != self.path:
-                    raise RequestError(404, 'Not found')
                 if not self.authenticated():
                     return self.result(401, {'error': 'Credential required'},
                                        **{'WWW-Authenticate': 'Bearer realm="PrintBench"'})
+                route = ROUTE.fullmatch(self.path)
+                if route is None or self.requestline.split()[1] != self.path:
+                    raise RequestError(404, 'Not found')
                 if self.headers.defects or any(self.headers.get_all(name) is not None for name in
                                                ('Transfer-Encoding', 'Content-Encoding', 'Expect')):
                     raise RequestError(400, 'Unsupported request framing')
@@ -253,7 +231,4 @@ def make_management_server(store, port, credential, *, host=None, tls=None):
             except OSError:
                 return self.result(500, {'error': 'Storage or connection error; read back before retrying'})
 
-        do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = do_PATCH = do_OPTIONS = manage
-
-    listener = LimitedServer(bind, ManagementHandler)
-    return listener
+    return ManagementHandler

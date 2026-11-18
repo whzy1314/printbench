@@ -13,7 +13,6 @@ import unittest
 from unittest.mock import patch
 
 from printbench import server, store
-from printbench.management import make_management_server
 from printbench.store import Store
 import test_store
 
@@ -42,8 +41,7 @@ class ManagementTests(unittest.TestCase):
         self.token = self.base / 'credential'
         self.token.write_text(TOKEN + '\n')
         self.token.chmod(0o600)
-        self.read = self.start(server.make_server(self.store, 0))
-        self.manage = self.start(make_management_server(self.store, 0, self.token))
+        self.read = self.manage = self.start(server.make_server(self.store, 0, management_token_file=self.token))
 
     def start(self, listener):
         t = threading.Thread(target=listener.serve_forever, daemon=True)
@@ -82,16 +80,28 @@ class ManagementTests(unittest.TestCase):
                               capture_output=True, text=True, timeout=5)
 
     def test_read_listener_and_credential_gates(self):
+        disabled = self.start(server.make_server(self.store, 0))
         for method in ('POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'):
-            self.assertEqual(self.request(self.read, method, PATH,
+            self.assertEqual(self.request(disabled, method, PATH,
                 AUTH | {'Host': 'manage.example', 'X-Forwarded-Host': 'manage.example',
                         'X-Original-URL': PATH}, frame(self.spec))[0], 405)
-        self.assertEqual(self.request(self.read, 'GET', PATH + '/state', AUTH)[0], 404)
-        self.assertEqual(self.request(self.manage, 'PUT', PATH, {'Content-Length': '100'})[0], 401)
+        self.assertEqual(self.request(disabled, 'GET', PATH + '/state', AUTH)[0], 404)
+        self.assertEqual(self.request(self.manage, 'PUT', PATH, {'Content-Length': '100',
+                         'Expect': '100-continue', 'X-Forwarded-Proto': 'https', 'X-Real-IP': '127.0.0.1'})[0], 401)
+        self.assertEqual(self.request(self.manage, 'PROPFIND', PATH)[0], 401)
         self.assertEqual(self.manage_request('GET', PATH + '/state', {'Authorization': 'Bearer ' + 'b' * 64})[0], 401)
         self.assertEqual(self.manage_request('GET', PATH + '/state', {'Host': 'other.example',
                          'X-Forwarded-Host': 'localhost'})[0], 403)
-        self.assertEqual(self.manage_request('GET', '/api/projects')[0], 404)
+        self.assertEqual(self.request(self.read, 'GET', '/api/projects')[0], 200)
+        self.assertEqual(self.manage_request('PUT', '/api/projects', body=frame(self.spec))[0], 405)
+        self.assertEqual(self.request(self.manage, 'GET', PATH + '/state?x=y', AUTH)[0], 404)
+        with closing(HTTPConnection('127.0.0.1', self.manage.server_port, timeout=2)) as conn:
+            conn.putrequest('PUT', PATH)
+            conn.putheader('Authorization', AUTH['Authorization'])
+            conn.putheader('Authorization', AUTH['Authorization'])
+            conn.putheader('Content-Length', '100')
+            conn.endheaders()
+            self.assertEqual(conn.getresponse().status, 401)  # No body sent.
         self.token.chmod(0o644)
         self.assertEqual(self.publish()[0], 503)
         self.token.unlink()
@@ -128,6 +138,20 @@ class ManagementTests(unittest.TestCase):
             conn.endheaders()
             self.assertEqual(conn.getresponse().status, 400)
         self.assertFalse(self.store.root.exists())
+
+    def test_direct_backend_host_and_bearer_are_independent(self):
+        with patch('printbench.server.address', return_value=('127.0.0.1', 0)):
+            listener = self.start(server.make_server(self.store, 0, host='bench.example',
+                                                       management_token_file=self.token))
+        host = {'Host': 'bench.example'}
+        spoof = {'X-Forwarded-Host': 'bench.example', 'X-Forwarded-Proto': 'https'}
+        self.assertEqual(self.request(listener, 'GET', '/api/projects', host)[0], 200)
+        self.assertEqual(self.request(listener, 'GET', PATH + '/state', host | spoof)[0], 401)
+        self.assertEqual(self.request(listener, 'GET', PATH + '/state', AUTH | spoof)[0], 403)
+        self.assertFalse(self.store.root.exists())
+        put = host | AUTH | {'Content-Type': UPLOAD, 'If-None-Match': '*'}
+        self.assertEqual(self.request(listener, 'PUT', PATH, put, frame(self.spec))[0], 201)
+        self.assertEqual(self.request(listener, 'GET', '/api/projects/tile', host)[0], 200)
 
     def test_create_append_archive_restore_preserves_hashes_and_rejects_replays(self):
         self.assertEqual(self.publish()[0], 201)

@@ -1,19 +1,20 @@
+from contextlib import closing
 import json
-from http.client import HTTPSConnection, RemoteDisconnected
+import os
+from http.client import HTTPConnection
 from pathlib import Path
 import shutil
 import ssl
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from printbench.management import make_management_server
 from printbench.server import make_server
-from printbench.store import BenchError, Store
+from printbench.store import Store
 
 
 @unittest.skipUnless(shutil.which('openssl'), 'openssl required for an isolated TLS fixture')
@@ -48,21 +49,71 @@ class ClientTests(unittest.TestCase):
                                *(['--ca-file', str(self.cert)] if trust else []), *args],
                               capture_output=True, text=True, timeout=6)
 
+    def test_token_is_validated_before_startup(self):
+        base = [sys.executable, '-m', 'printbench', '--data', str(self.store.root), 'serve', '--port', '0']
+        env = os.environ | {'PRINTBENCH_MANAGEMENT_TOKEN_FILE': str(self.token)}
+        for value, mode in ((None, 0o600), ('invalid', 0o600), ('a' * 64, 0o644)):
+            with self.subTest(present=value is not None, mode=mode):
+                if value is None:
+                    self.token.unlink()
+                else:
+                    self.token.write_text(value)
+                    self.token.chmod(mode)
+                try:
+                    result = subprocess.run(base, env=env, capture_output=True, text=True, timeout=2)
+                except subprocess.TimeoutExpired as exc:
+                    self.fail(f'App served with invalid credentials: {bool(exc.stdout)} startup output')
+                self.assertEqual((result.returncode, result.stdout), (1, ''))
+                self.assertIn('credential', json.loads(result.stderr)['error'].lower())
+        self.assertFalse(self.store.root.exists())
+
     def test_actual_entry_point_opt_in_and_https_mutation(self):
         base = [sys.executable, '-m', 'printbench', '--data', str(self.store.root), 'serve', '--port', '0']
-        incomplete = subprocess.run(base + ['--management-port', '0'], capture_output=True, text=True, timeout=5)
-        self.assertEqual(incomplete.returncode, 1)
-        self.assertIn('credential', json.loads(incomplete.stderr)['error'].lower())
-        with subprocess.Popen(base + ['--management-port', '0', '--management-token-file', str(self.token),
-                                      '--management-cert-file', str(self.cert), '--management-key-file', str(self.key)],
+        seen = []
+        backend_port = None
+
+        class Edge(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def forward(self):
+                connection = HTTPConnection('127.0.0.1', backend_port, timeout=5)
+                headers = {key: self.headers[key] for key in ('Authorization', 'Content-Length',
+                           'Content-Type', 'If-Match', 'If-None-Match') if key in self.headers}
+                seen.append((self.path, headers.get('Authorization') == 'Bearer ' + 'a' * 64,
+                             'Authorization' in headers))
+                try:
+                    length = int(headers.get('Content-Length', '0'))
+                    connection.request(self.command, self.path, self.rfile.read(length), headers)
+                    response = connection.getresponse()
+                    content = response.read()
+                    self.send_response(response.status)
+                    for key, value in response.getheaders():
+                        if key.lower() not in ('date', 'server'):
+                            self.send_header(key, value)
+                    self.end_headers()
+                    self.wfile.write(content)
+                finally:
+                    connection.close()
+
+            do_GET = do_HEAD = do_POST = do_PUT = forward
+
+        with subprocess.Popen(base, env=os.environ | {'PRINTBENCH_MANAGEMENT_TOKEN_FILE': str(self.token)},
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as server:
             try:
                 import select
+                from urllib.parse import urlsplit
                 assert server.stdout is not None
                 self.assertTrue(select.select([server.stdout], [], [], 5)[0])
-                startup = json.loads(server.stdout.readline())
-                url = startup['management_url']
-                self.assertTrue(url.startswith('https://localhost:'))
+                startup_line = server.stdout.readline()
+                startup = json.loads(startup_line)
+                self.assertEqual(set(startup), {'url', 'data'})
+                backend_port = urlsplit(startup['url']).port
+                edge = HTTPServer(('127.0.0.1', 0), Edge)
+                edge.socket = self.tls.wrap_socket(edge.socket, server_side=True)
+                url = self.start(edge)
+                listed = self.client(url, 'list')
+                self.assertEqual((listed.returncode, json.loads(listed.stdout)), (0, []))
                 artifacts = self.root / 'artifacts'
                 artifacts.mkdir()
                 (artifacts / 'sample.txt').write_bytes(b'synthetic')
@@ -90,9 +141,19 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(restore.returncode, 0, restore.stderr)
                 self.assertFalse(json.loads(restore.stdout)['archived'])
                 self.assertEqual(self.store.history('sample'), {'current': 'r2', 'revisions': ['r1', 'r2']})
+                self.assertIn(('/api/projects', False, False), seen)
+                self.assertIn(('/manage/v1/projects/sample', True, True), seen)
+                self.assertNotIn('a' * 64, startup_line + create.stdout + create.stderr)
+                with closing(HTTPConnection('127.0.0.1', backend_port, timeout=3)) as direct:
+                    direct.request('GET', '/')
+                    view = direct.getresponse()
+                    self.assertEqual(view.status, 200)
+                    self.assertNotIn(b'a' * 64, view.read())
             finally:
-                server.terminate()
-                server.communicate(timeout=5)
+                if server.poll() is None:
+                    server.send_signal(signal.SIGINT)
+                out, err = server.communicate(timeout=5)
+                self.assertEqual((server.returncode, out, err), (0, '', ''))
 
     def test_verify_tls_no_redirect_and_credential_file_protection(self):
         class Redirect(BaseHTTPRequestHandler):
@@ -110,13 +171,12 @@ class ClientTests(unittest.TestCase):
         bounced = self.client(url, 'state', 'tile')
         self.assertIn('301', json.loads(bounced.stderr)['error'])
         self.assertEqual(Redirect.hits, 1)
-        live = self.start(make_management_server(self.store, 0, self.token, tls=self.tls))
-        for bad in (live.replace('https:', 'http:'), live.replace('localhost', '127.0.0.1'), live + '/path'):
+        for bad in (url.replace('https:', 'http:'), url.replace('localhost', '127.0.0.1'), url + '/path'):
             with self.subTest(url=bad):
                 self.assertNotEqual(self.client(bad, 'state', 'tile').returncode, 0)
-        self.assertNotEqual(self.client(live, 'state', 'tile', trust=False).returncode, 0)
+        self.assertNotEqual(self.client(url, 'state', 'tile', trust=False).returncode, 0)
         self.token.chmod(0o644)
-        unsafe = self.client(live, 'state', 'tile')
+        unsafe = self.client(url, 'state', 'tile')
         self.assertIn('protected', json.loads(unsafe.stderr)['error'].lower())
         self.assertFalse(self.store.root.exists())
 
@@ -136,33 +196,3 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(out.read_bytes(), b'synthetic')
         self.assertNotEqual(self.client(url, *args).returncode, 0)
         self.assertEqual(out.read_bytes(), b'synthetic')
-
-    def test_network_backend_requires_client_authenticated_tls_before_binding(self):
-        with self.assertRaisesRegex(BenchError, 'proxy client'):
-            with make_management_server(self.store, 0, self.token, host='bench.example', tls=self.tls):
-                self.fail('Network management must not bind without proxy authentication')
-
-    def test_proxy_tls_identity_and_application_bearer_are_both_required(self):
-        self.tls.load_verify_locations(cafile=self.cert)
-        self.tls.verify_mode = ssl.CERT_REQUIRED
-        with patch('printbench.management.address', return_value=('127.0.0.1', 0)):
-            listener = make_management_server(self.store, 0, self.token, host='bench.example', tls=self.tls)
-        self.start(listener)
-        tls = ssl.create_default_context(cafile=self.cert)
-
-        def probe(context, headers):
-            conn = HTTPSConnection('localhost', listener.server_port, timeout=3, context=context)
-            try:
-                conn.request('GET', '/manage/v1/projects/tile/state', headers=headers)
-                response = conn.getresponse()
-                return response.status, response.read()
-            finally:
-                conn.close()
-        good = {'Host': 'bench.example', 'Authorization': 'Bearer ' + 'a' * 64}
-        with self.assertRaises((ssl.SSLError, RemoteDisconnected, ConnectionResetError)):
-            probe(tls, good | {'X-Forwarded-Proto': 'https'})
-        tls.load_cert_chain(self.cert, self.key)  # Synthetic cert only, never a production proxy key.
-        self.assertEqual(probe(tls, {'Host': 'bench.example'})[0], 401)
-        self.assertEqual(probe(tls, good | {'Host': 'wrong.example', 'X-Forwarded-Host': 'bench.example'})[0], 403)
-        self.assertEqual(probe(tls, good), (404, b'{"error": "Not found"}'))
-        self.assertFalse(self.store.root.exists())

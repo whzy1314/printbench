@@ -1,4 +1,4 @@
-"""Read-only browser HTTP, loopback by default."""
+"""Browser reads and optional authenticated management, loopback by default."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -42,7 +42,7 @@ class Handler(BaseHTTPRequestHandler):
         pass  # No artifact contents or untrusted paths in server logs.
 
 
-def make_server(store, port=8765, *, host=None):
+def make_server(store, port=8765, *, host=None, management_token_file=None):
     bind = address(port, host)
 
     class ReadHandler(Handler):
@@ -92,4 +92,7 @@ def make_server(store, port=8765, *, host=None):
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_POST
 
+    if management_token_file is not None:
+        from .management import management_handler
+        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, management_token_file, host=host))
     return ThreadingHTTPServer(bind, ReadHandler)

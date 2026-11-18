@@ -23,19 +23,12 @@
 {{- end }}
 {{- $management := .Values.management }}
 {{- if hasKey .Values "management" }}
-{{- if or (not (kindIs "map" $management)) (ne (len $management) 3) }}
-{{- fail "management requires only host, tokenSecret and tlsSecret" }}
+{{- if or (not (kindIs "map" $management)) (ne (len $management) 1) }}
+{{- fail "management requires only tokenSecret" }}
 {{- end }}
-{{- if or (not (kindIs "string" $management.host)) (gt (len $management.host) 253) (not (regexMatch $dns $management.host)) }}
-{{- fail "management.host must be a canonical lowercase DNS hostname" }}
-{{- end }}
-{{- range $name := list $management.tokenSecret $management.tlsSecret }}
+{{- $name := $management.tokenSecret }}
 {{- if or (not (kindIs "string" $name)) (gt (len $name) 253) (not (regexMatch `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` $name)) }}
-{{- fail "management requires valid tokenSecret and tlsSecret names" }}
-{{- end }}
-{{- end }}
-{{- if eq $management.tokenSecret $management.tlsSecret }}
-{{- fail "management tokenSecret and tlsSecret must be separate" }}
+{{- fail "management requires a valid tokenSecret name" }}
 {{- end }}
 {{- end }}
 apiVersion: apps/v1
@@ -83,22 +76,13 @@ spec:
               value: {{ $ingressHost | quote }}
             {{- end }}
             {{- if $management }}
-            - {name: PRINTBENCH_MANAGEMENT_PORT, value: "8766"}
-            - {name: PRINTBENCH_MANAGEMENT_HOST, value: {{ $management.host | quote }}}
             - {name: PRINTBENCH_MANAGEMENT_TOKEN_FILE, value: /run/printbench/token/token}
-            - {name: PRINTBENCH_MANAGEMENT_CERT_FILE, value: /run/printbench/tls/tls.crt}
-            - {name: PRINTBENCH_MANAGEMENT_KEY_FILE, value: /run/printbench/tls/tls.key}
-            - {name: PRINTBENCH_MANAGEMENT_PROXY_CA_FILE, value: /run/printbench/tls/ca.crt}
             {{- end }}
+          {{- end }}
+          {{- if $ingressHost }}
           ports:
-            {{- if $ingressHost }}
             - name: http
               containerPort: 8765
-            {{- end }}
-            {{- if $management }}
-            - name: management
-              containerPort: 8766
-            {{- end }}
           {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
@@ -110,7 +94,6 @@ spec:
               mountPath: /data
             {{- if $management }}
             - {name: management-token, mountPath: /run/printbench/token, readOnly: true}
-            - {name: management-tls, mountPath: /run/printbench/tls, readOnly: true}
             {{- end }}
           readinessProbe:
             exec:
@@ -148,31 +131,7 @@ spec:
             defaultMode: 288 # 0440
             items:
               - {key: token, path: token}
-        - name: management-tls
-          secret:
-            secretName: {{ $management.tlsSecret | quote }}
-            defaultMode: 288 # 0440
-            items:
-              - {key: tls.crt, path: tls.crt}
-              - {key: tls.key, path: tls.key}
-              - {key: ca.crt, path: ca.crt}
         {{- end }}
-{{- if $management }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ printf "%s-management" .Release.Name | quote }}
-  namespace: {{ .Release.Namespace | quote }}
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: {{ .Release.Name | quote }}
-  ports:
-    - name: https
-      port: 443
-      targetPort: management
-{{- end }}
 {{- if $ingressHost }}
 ---
 apiVersion: v1

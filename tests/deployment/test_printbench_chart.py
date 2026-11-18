@@ -101,40 +101,28 @@ class ChartTests(unittest.TestCase):
                 self.assertIn("ingressHost", result.stderr)
                 self.assertEqual(result.stdout, "")
 
-    def test_management_adds_separate_tls_backend_without_touching_read_route_or_storage(self):
+    def test_management_projects_only_token_on_the_existing_workload(self):
         plain = render(ingressHost="bench.example")
         opted = render(ingressHost="bench.example", management={
-            "host": "bench.example", "tokenSecret": "bench-token", "tlsSecret": "bench-tls"})
+            "tokenSecret": "bench-token"})
         self.assertEqual(opted.returncode, 0, opted.stderr)
         docs = {(d['kind'], d['metadata']['name']):d for d in yaml.safe_load_all(opted.stdout)}
-        svc = docs.pop(('Service', 'bench-management'))
-        self.assertEqual(svc['spec']['type'], 'ClusterIP')
-        self.assertEqual(svc['spec']['ports'], [{'name': 'https', 'port': 443, 'targetPort': 'management'}])
         deployment = docs[('Deployment', 'bench')]
-        self.assertEqual(svc['spec']['selector'], deployment['spec']['selector']['matchLabels'])
         pod = deployment['spec']['template']['spec']
         container = pod['containers'][0]
-        self.assertEqual(container['ports'].pop(), {'name': 'management', 'containerPort': 8766})
         env = {row['name']:row['value'] for row in container['env'] if row['name'] != 'PRINTBENCH_HOST'}
-        self.assertEqual(env, {'PRINTBENCH_MANAGEMENT_PORT': '8766', 'PRINTBENCH_MANAGEMENT_HOST': 'bench.example',
-            'PRINTBENCH_MANAGEMENT_TOKEN_FILE': '/run/printbench/token/token',
-            'PRINTBENCH_MANAGEMENT_CERT_FILE': '/run/printbench/tls/tls.crt',
-            'PRINTBENCH_MANAGEMENT_KEY_FILE': '/run/printbench/tls/tls.key',
-            'PRINTBENCH_MANAGEMENT_PROXY_CA_FILE': '/run/printbench/tls/ca.crt'})
+        self.assertEqual(env, {'PRINTBENCH_MANAGEMENT_TOKEN_FILE': '/run/printbench/token/token'})
         container['env'] = [row for row in container['env'] if row['name'] == 'PRINTBENCH_HOST']
-        for expected, keys in [('bench-tls', ['tls.crt', 'tls.key', 'ca.crt']), ('bench-token', ['token'])]:
-            self.assertTrue(container['volumeMounts'].pop()['readOnly'])
-            mounted = pod['volumes'].pop()['secret']
-            self.assertEqual(mounted['secretName'], expected)
-            self.assertEqual(mounted['defaultMode'], 0o440)
-            self.assertEqual(mounted['items'], [{'key': key, 'path': key} for key in keys])
+        self.assertEqual(container['volumeMounts'].pop(), {'name': 'management-token',
+                         'mountPath': '/run/printbench/token', 'readOnly': True})
+        self.assertEqual(pod['volumes'].pop(), {'name': 'management-token', 'secret': {
+            'secretName': 'bench-token', 'defaultMode': 0o440, 'items': [{'key': 'token', 'path': 'token'}]}})
         self.assertEqual(docs, {(d['kind'], d['metadata']['name']):d for d in yaml.safe_load_all(plain.stdout)})
 
     def test_management_refuses_missing_or_malformed_values(self):
-        for override in (None, False, {}, {'host': 'bench.example'}, {'host': 'bad', 'tokenSecret': 'a', 'tlsSecret': 'b'},
-                         {'host': 'bench.example', 'tokenSecret': 'A/B', 'tlsSecret': 'b'},
-                         {'host': 'bench.example', 'tokenSecret': 'a', 'tlsSecret': 'a'},
-                         {'host': 'bench.example', 'tokenSecret': 'a', 'tlsSecret': 'b', 'extra': 'bad'}):
+        for override in (None, False, {}, {'host': 'bench.example'}, {'tokenSecret': ''},
+                         {'tokenSecret': 'A/B'}, {'tokenSecret': None}, {'tokenSecret': 123},
+                         {'host': 'bench.example', 'tokenSecret': 'a', 'tlsSecret': 'b'}):
             with self.subTest(override=override):
                 result = render(management=override)
                 self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
