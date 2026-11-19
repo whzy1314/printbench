@@ -2,12 +2,14 @@
 from contextlib import contextmanager
 import hmac
 from http.server import HTTPServer
+from io import BufferedIOBase
 import json
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import sys
 import threading
 import time
 from typing import cast
@@ -21,10 +23,12 @@ MANAGEMENT_ROOT = '/manage/v1/'
 PREFIX = MANAGEMENT_ROOT + 'projects/'
 ROUTE = re.compile(PREFIX + r'([a-z0-9][a-z0-9-]{0,63})(?:/(state|archive|restore))?')
 TOKEN = re.compile(rb'[a-f0-9]{64}\n?')
+PROOF_HEADER_LINE = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+:[^\r\n]*\r\n")
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_BODY = 4 + MAX_JSON + MAX_ARTIFACT_BYTES
 SOCKET_TIMEOUT = 10
 SHUTDOWN_WINDOW = 600
+RETIRED_PROOF_SECONDS = 300
 
 
 @contextmanager
@@ -80,28 +84,59 @@ def unique_object(pairs):
     return result
 
 
+class _ProofHeaderReader(BufferedIOBase):
+    # The stdlib accepts EOF as a terminator and parses names using email field syntax.
+    def __init__(self, stream):
+        self.stream = stream
+        self.valid = True
+        self.complete = False
+
+    def readline(self, size=-1, /):
+        line = self.stream.readline(size)
+        self.complete = line == b'\r\n'
+        if not self.complete and not PROOF_HEADER_LINE.fullmatch(line):
+            self.valid = False
+        return line
+
+
 def management_handler(base: type[Handler], store, credential, *, host=None, proof=False, shutdown_probe=False):
     credential = Path(credential).absolute()
     try:
-        read_token(credential, projection=True)
+        startup = read_token(credential, projection=True)
     except (OSError, BenchError):
         if proof:
             raise BenchError('Proof mode requires a valid protected sentinel file') from None
         raise BenchError('Management requires a valid protected credential file') from None
+    if not proof:
+        startup = None
+    proof_deadline = time.monotonic() + RETIRED_PROOF_SECONDS if proof else 0
     slots = threading.BoundedSemaphore(2)
     probe_lock = threading.Lock()
     probe = None
     owner_pid = os.getpid()
 
     class ManagementHandler(base):
+        raw_requestline: bytes  # Set by BaseHTTPRequestHandler before parse_request.
+
         def parse_request(self):
-            if not super().parse_request():
+            stream = self.rfile
+            reader = _ProofHeaderReader(stream) if proof else None
+            if reader is not None:
+                self.rfile = reader
+            try:
+                parsed = super().parse_request()
+            finally:
+                self.rfile = stream
+            if not parsed:
                 return False
             if not self.path.startswith(MANAGEMENT_ROOT):
                 return True
             # Dispatch all methods here so unknown methods cannot bypass management auth.
             self.close_connection = True
             self.connection.settimeout(SOCKET_TIMEOUT)
+            if reader is not None and not (reader.valid and reader.complete):
+                self.send_error(400)
+                return False
             if not slots.acquire(blocking=False):
                 self.result(503, {'error': 'Management busy'})
                 return False
@@ -262,12 +297,25 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                 if proof:
                     if action != 'state' or self.command != 'GET':
                         raise RequestError(403, 'Only the state probe is enabled')
-                    if length not in (None, 0) or any('\r' in value or '\n' in value
-                                                      for _, value in self.headers.raw_items()):
+                    if (length not in (None, 0)
+                            or self.request_version not in ('HTTP/1.0', 'HTTP/1.1')
+                            or self.raw_requestline != f'GET {self.path} {self.request_version}\r\n'.encode('ascii')
+                            or any(re.search(r'[\x00-\x08\x0a-\x1f\x7f]', value)
+                                   for _, value in self.headers.raw_items())):
                         raise RequestError(400, 'Expected an unambiguous bodyless state probe')
-                    if self.matches_credential():
+                    token, bearer = self.current_token(), self.bearer()
+                    if bearer is None:
+                        return self.denied()
+                    if hmac.compare_digest(bearer, token):
                         # Correlate to this response without reflecting request data.
                         return self.denied(**{'X-PrintBench-Proof-Receipt': secrets.token_hex(16)})
+                    # The same validated projection already failed the exact match above.
+                    if (startup is not None and time.monotonic() < proof_deadline
+                            and hmac.compare_digest(bearer, startup)):
+                        receipt = secrets.token_hex(16)
+                        sys.stderr.write(json.dumps({'receipt': receipt, 'verdict': 'retired'}) + '\n')
+                        sys.stderr.flush()
+                        return self.denied(**{'X-PrintBench-Retired-Proof-Receipt': receipt})
                     return self.denied()
                 allowed_method = {None: 'PUT', 'state': 'GET', 'archive': 'POST', 'restore': 'POST'}[action]
                 if self.command != allowed_method:
