@@ -1,6 +1,6 @@
 ---
 name: printbench
-description: Use when the 3D Designer needs to retrieve, publish, archive, or restore a hosted PrintBench project or revision.
+description: Use when reading or writing hosted PrintBench projects.
 ---
 
 # Hosted PrintBench library
