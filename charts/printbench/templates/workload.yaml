@@ -64,6 +64,10 @@ spec:
       labels:
         app.kubernetes.io/name: {{ .Release.Name | quote }}
     spec:
+      {{- if $anonymous }}
+      # Allow the 60s upload deadline plus time for normal commit and response.
+      terminationGracePeriodSeconds: 90
+      {{- end }}
       automountServiceAccountToken: false
       enableServiceLinks: false
       nodeSelector:

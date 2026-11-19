@@ -130,13 +130,16 @@ class ChartTests(unittest.TestCase):
                     'name': 'PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE', 'value': '1'})
                 self.assertEqual(docs, base)
 
-    def test_anonymous_is_disabled_by_default_and_adds_only_an_env_flag(self):
+    def test_anonymous_adds_only_an_env_flag_and_shutdown_grace(self):
         for values in ({}, {'ingressHost': 'bench.example'}):
             with self.subTest(values=values):
                 base = self.manifests(**values)
+                self.assertNotIn('terminationGracePeriodSeconds', base['Deployment']['spec']['template']['spec'])
                 self.assertEqual(self.manifests(management={'anonymous': False}, **values), base)
                 docs = self.manifests(management={'anonymous': True}, **values)
-                container = docs['Deployment']['spec']['template']['spec']['containers'][0]
+                pod = docs['Deployment']['spec']['template']['spec']
+                self.assertEqual(pod.pop('terminationGracePeriodSeconds', None), 90)
+                container = pod['containers'][0]
                 self.assertEqual(container['env'].pop(), {
                     'name': 'PRINTBENCH_MANAGEMENT_ANONYMOUS', 'value': '1'})
                 if not container['env']:
