@@ -2,7 +2,9 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import sys
+import threading
 
 from .store import BenchError, Store, directory, read_json
 
@@ -23,9 +25,21 @@ def serve_library(store, args):
     shutdown_probe = os.environ.get('PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE')
     if shutdown_probe not in (None, '1'):
         raise BenchError('Set the management shutdown probe opt-in to 1 or omit it')
+    anonymous = os.environ.get('PRINTBENCH_MANAGEMENT_ANONYMOUS')
+    if anonymous not in (None, '1'):
+        raise BenchError('Set PRINTBENCH_MANAGEMENT_ANONYMOUS to 1 or omit it')
     with make_server(store, args.port, host=args.host, management_token_file=args.management_token_file,
                      management_proof_file=os.environ.get('PRINTBENCH_MANAGEMENT_PROOF_FILE'),
-                     shutdown_probe=shutdown_probe == '1') as server:
+                     shutdown_probe=shutdown_probe == '1', anonymous=anonymous == '1') as server:
+        if anonymous:
+            signals = {signal.SIGINT, signal.SIGTERM}
+            signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+
+            def stop():
+                signal.sigwait(signals)
+                server.shutdown()  # Must run off the serve_forever thread.
+
+            threading.Thread(target=stop, daemon=True).start()
         print(json.dumps({"url": f"http://127.0.0.1:{server.server_port}", "data": str(store.root)}), flush=True)
         server.serve_forever()
 

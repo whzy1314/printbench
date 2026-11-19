@@ -67,8 +67,16 @@ class ClientTests(unittest.TestCase):
                 self.assertIn('credential', json.loads(result.stderr)['error'].lower())
         self.assertFalse(self.store.root.exists())
 
-    def test_actual_entry_point_opt_in_and_https_mutation(self):
+    def test_actual_entry_point_bearer_opt_in_and_https_mutation(self):
+        self.exercise_https_mutation(anonymous=False)
+
+    def test_actual_entry_point_anonymous_opt_in_and_https_mutation(self):
+        self.exercise_https_mutation(anonymous=True)
+
+    def exercise_https_mutation(self, *, anonymous):
         base = [sys.executable, '-m', 'printbench', '--data', str(self.store.root), 'serve', '--port', '0']
+        config = ({'PRINTBENCH_MANAGEMENT_ANONYMOUS': '1'} if anonymous else
+                  {'PRINTBENCH_MANAGEMENT_TOKEN_FILE': str(self.token)})
         seen = []
         backend_port = None
 
@@ -98,7 +106,7 @@ class ClientTests(unittest.TestCase):
 
             do_GET = do_HEAD = do_POST = do_PUT = forward
 
-        with subprocess.Popen(base, env=os.environ | {'PRINTBENCH_MANAGEMENT_TOKEN_FILE': str(self.token)},
+        with subprocess.Popen(base, env=os.environ | config,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as server:
             try:
                 import select
@@ -112,37 +120,57 @@ class ClientTests(unittest.TestCase):
                 edge = HTTPServer(('127.0.0.1', 0), Edge)
                 edge.socket = self.tls.wrap_socket(edge.socket, server_side=True)
                 url = self.start(edge)
+                def manage(*args):
+                    return self.client(url, *(['--anonymous'] if anonymous else []), *args, auth=not anonymous)
+
                 listed = self.client(url, 'list')
                 self.assertEqual((listed.returncode, json.loads(listed.stdout)), (0, []))
                 artifacts = self.root / 'artifacts'
                 artifacts.mkdir()
                 (artifacts / 'sample.txt').write_bytes(b'synthetic')
-                create = self.client(url, 'create', '--spec', 'examples/sample.json', '--source', str(artifacts))
+                create_args = ('create', '--spec', 'examples/sample.json', '--source', str(artifacts))
+                if anonymous:
+                    for flags, diagnostic in (([], 'credential'),
+                                              (['--anonymous', '--token-file', str(self.token)], 'not allowed')):
+                        refused = self.client(url, *flags, *create_args, auth=False)
+                        self.assertEqual((refused.returncode, refused.stdout), (1, ''))
+                        self.assertIn(diagnostic, json.loads(refused.stderr)['error'])
+                    self.assertFalse(any(path.startswith('/manage/') for path, _, _ in seen))
+                create = manage(*create_args)
                 self.assertEqual(create.returncode, 0, create.stderr)
                 self.assertEqual(json.loads(create.stdout)['revision'], 'r1')
-                result = self.client(url, 'state', 'sample')
+                result = manage('state', 'sample')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 state = json.loads(result.stdout)
                 self.assertEqual(state['current'], 'r1')
                 spec = json.loads(Path('examples/sample.json').read_bytes())
                 spec_file = self.root / 'append.json'
                 spec_file.write_text(json.dumps(dict(spec, revision='r2')))
-                append = self.client(url, 'append', '--spec', str(spec_file), '--source', str(artifacts),
-                                     '--match', state['etag'])
+                (artifacts / 'sample.txt').write_bytes(b'changed synthetic bytes')
+                append = manage('append', '--spec', str(spec_file), '--source', str(artifacts), '--match', state['etag'])
                 self.assertEqual(append.returncode, 0, append.stderr)
                 self.assertEqual(json.loads(append.stdout)['revision'], 'r2')
-                latest = json.loads(self.client(url, 'state', 'sample').stdout)
-                archive = self.client(url, 'archive', 'sample', '--match', latest['etag'])
+                latest = json.loads(manage('state', 'sample').stdout)
+                archive = manage('archive', 'sample', '--match', latest['etag'])
                 self.assertEqual(archive.returncode, 0, archive.stderr)
                 archived = json.loads(archive.stdout)
                 self.assertTrue(archived['archived'])
                 self.assertEqual(self.store.list(), [])
-                restore = self.client(url, 'restore', 'sample', '--match', archived['etag'])
+                restore = manage('restore', 'sample', '--match', archived['etag'])
                 self.assertEqual(restore.returncode, 0, restore.stderr)
                 self.assertFalse(json.loads(restore.stdout)['archived'])
                 self.assertEqual(self.store.history('sample'), {'current': 'r2', 'revisions': ['r1', 'r2']})
+                if anonymous:
+                    for revision, data in (('r1', b'synthetic'), ('r2', b'changed synthetic bytes')):
+                        output = self.root / revision
+                        downloaded = self.client(url, 'download', 'sample', '--revision', revision,
+                                                 'sample.txt', '--output', str(output), auth=False)
+                        self.assertEqual(downloaded.returncode, 0, downloaded.stderr)
+                        self.assertEqual(output.read_bytes(), data)
                 self.assertIn(('/api/projects', False, False), seen)
-                self.assertIn(('/manage/v1/projects/sample', True, True), seen)
+                self.assertIn(('/manage/v1/projects/sample', not anonymous, not anonymous), seen)
+                if anonymous:
+                    self.assertFalse(any(present for _, _, present in seen))
                 self.assertNotIn('a' * 64, startup_line + create.stdout + create.stderr)
                 with closing(HTTPConnection('127.0.0.1', backend_port, timeout=3)) as direct:
                     direct.request('GET', '/')

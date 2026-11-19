@@ -130,6 +130,32 @@ class ChartTests(unittest.TestCase):
                     'name': 'PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE', 'value': '1'})
                 self.assertEqual(docs, base)
 
+    def test_anonymous_is_disabled_by_default_and_adds_only_an_env_flag(self):
+        for values in ({}, {'ingressHost': 'bench.example'}):
+            with self.subTest(values=values):
+                base = self.manifests(**values)
+                self.assertEqual(self.manifests(management={'anonymous': False}, **values), base)
+                docs = self.manifests(management={'anonymous': True}, **values)
+                container = docs['Deployment']['spec']['template']['spec']['containers'][0]
+                self.assertEqual(container['env'].pop(), {
+                    'name': 'PRINTBENCH_MANAGEMENT_ANONYMOUS', 'value': '1'})
+                if not container['env']:
+                    del container['env']
+                self.assertEqual(docs, base)
+
+    def test_anonymous_rejects_non_booleans_and_mixed_settings(self):
+        for config in (
+            *({'anonymous': value} for value in (None, '', 'true', 'false', 0, 1, [], {})),
+            *({'anonymous': value, **other} for value in (True, False) for other in (
+                {'tokenSecret': 'writer'}, {'proofSecret': 'proof'}, {'shutdownProbe': True},
+                {'shutdownProbe': False}, {'unknown': False})),
+        ):
+            with self.subTest(config=config):
+                result = render(management=config)
+                self.assertEqual(result.returncode, 1, result.stdout or result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('management', result.stderr)
+
     def test_explicitly_disabled_shutdown_probe_preserves_writer_render(self):
         writer = {'tokenSecret': 'bench-token'}
         base = render(management=writer)

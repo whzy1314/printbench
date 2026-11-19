@@ -1,4 +1,4 @@
-"""Browser reads and optional authenticated management, loopback by default."""
+"""Browser reads and optional management, loopback by default."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
@@ -43,9 +43,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(store, port=8765, *, host=None, management_token_file=None, management_proof_file=None,
-                shutdown_probe=False):
+                shutdown_probe=False, anonymous=False):
     bind = address(port, host)
     proof = management_proof_file is not None
+    if type(anonymous) is not bool:
+        raise BenchError('Anonymous management requires a boolean')
+    if anonymous and (proof or management_token_file is not None or shutdown_probe):
+        raise BenchError('Anonymous management is mutually exclusive with token, proof and shutdown probe settings')
     if shutdown_probe and (proof or management_token_file is None):
         raise BenchError('Management shutdown probe requires writer mode only')
     if proof and management_token_file is not None:
@@ -98,9 +102,12 @@ def make_server(store, port=8765, *, host=None, management_token_file=None, mana
 
         do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_POST
 
-    if proof or management_token_file is not None:
+    if proof or management_token_file is not None or anonymous:
         from .management import management_handler
         credential = management_proof_file if proof else management_token_file
-        return ThreadingHTTPServer(bind, management_handler(ReadHandler, store, credential, host=host,
-                                                            proof=proof, shutdown_probe=shutdown_probe))
+        listener = ThreadingHTTPServer(bind, management_handler(ReadHandler, store, credential, host=host,
+                                       proof=proof, shutdown_probe=shutdown_probe, anonymous=anonymous))
+        # server_close joins non-daemon request threads before the writer exits.
+        listener.daemon_threads = not anonymous
+        return listener
     return ThreadingHTTPServer(bind, ReadHandler)

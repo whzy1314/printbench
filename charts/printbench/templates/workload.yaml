@@ -25,9 +25,15 @@
 {{- $proof := false }}
 {{- $secretName := "" }}
 {{- $shutdownProbe := false }}
-{{- if hasKey .Values "management" }}
+{{- $anonymous := false }}
+{{- if and (kindIs "map" $management) (hasKey $management "anonymous") }}
+{{- if or (not (kindIs "bool" $management.anonymous)) (ne (len $management) 1) }}
+{{- fail "management.anonymous must be a boolean and cannot be combined with other management settings" }}
+{{- end }}
+{{- $anonymous = $management.anonymous }}
+{{- else if hasKey .Values "management" }}
 {{- if or (not (kindIs "map" $management)) (ne (len (omit $management "shutdownProbe")) 1) }}
-{{- fail "management requires exactly one of tokenSecret or proofSecret" }}
+{{- fail "management requires exactly one of tokenSecret, proofSecret or anonymous" }}
 {{- end }}
 {{- $proof = hasKey $management "proofSecret" }}
 {{- $secretName = ternary $management.proofSecret $management.tokenSecret $proof }}
@@ -79,15 +85,17 @@ spec:
         - name: printbench
           image: {{ $image | quote }}
           imagePullPolicy: Always
-          {{- if or $ingressHost $management }}
+          {{- if or $ingressHost $secretName $anonymous }}
           env:
             {{- if $ingressHost }}
             - name: PRINTBENCH_HOST
               value: {{ $ingressHost | quote }}
             {{- end }}
-            {{- if $proof }}
+            {{- if $anonymous }}
+            - {name: PRINTBENCH_MANAGEMENT_ANONYMOUS, value: "1"}
+            {{- else if $proof }}
             - {name: PRINTBENCH_MANAGEMENT_PROOF_FILE, value: /run/printbench/token/sentinel}
-            {{- else if $management }}
+            {{- else if $secretName }}
             - {name: PRINTBENCH_MANAGEMENT_TOKEN_FILE, value: /run/printbench/token/token}
             {{- if $shutdownProbe }}
             - {name: PRINTBENCH_MANAGEMENT_SHUTDOWN_PROBE, value: "1"}
@@ -107,7 +115,7 @@ spec:
           volumeMounts:
             - name: library
               mountPath: /data
-            {{- if $management }}
+            {{- if $secretName }}
             - {name: management-token, mountPath: /run/printbench/token, readOnly: true}
             {{- end }}
           readinessProbe:
@@ -139,7 +147,7 @@ spec:
         - name: library
           persistentVolumeClaim:
             claimName: {{ .Release.Name }}-library
-        {{- if $management }}
+        {{- if $secretName }}
         - name: management-token
           secret:
             secretName: {{ $secretName | quote }}

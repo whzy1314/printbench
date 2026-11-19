@@ -1,4 +1,4 @@
-"""Bounded, authenticated management protocol, separate from browser routes."""
+"""Bounded management protocol, separate from browser routes."""
 from contextlib import contextmanager
 import hmac
 from http.server import HTTPServer
@@ -99,16 +99,19 @@ class _ProofHeaderReader(BufferedIOBase):
         return line
 
 
-def management_handler(base: type[Handler], store, credential, *, host=None, proof=False, shutdown_probe=False):
-    credential = Path(credential).absolute()
-    try:
-        startup = read_token(credential, projection=True)
-    except (OSError, BenchError):
-        if proof:
-            raise BenchError('Proof mode requires a valid protected sentinel file') from None
-        raise BenchError('Management requires a valid protected credential file') from None
-    if not proof:
-        startup = None
+def management_handler(base: type[Handler], store, credential, *, host=None, proof=False, shutdown_probe=False,
+                       anonymous=False):
+    startup = None
+    if not anonymous:
+        credential = Path(credential).absolute()
+        try:
+            startup = read_token(credential, projection=True)
+        except (OSError, BenchError):
+            if proof:
+                raise BenchError('Proof mode requires a valid protected sentinel file') from None
+            raise BenchError('Management requires a valid protected credential file') from None
+        if not proof:
+            startup = None
     proof_deadline = time.monotonic() + RETIRED_PROOF_SECONDS if proof else 0
     slots = threading.BoundedSemaphore(2)
     probe_lock = threading.Lock()
@@ -117,6 +120,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
 
     class ManagementHandler(base):
         raw_requestline: bytes  # Set by BaseHTTPRequestHandler before parse_request.
+        timeout = SOCKET_TIMEOUT if anonymous else base.timeout  # Bound idle connections during drain.
 
         def parse_request(self):
             stream = self.rfile
@@ -131,7 +135,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                 return False
             if not self.path.startswith(MANAGEMENT_ROOT):
                 return True
-            # Dispatch all methods here so unknown methods cannot bypass management auth.
+            # Apply the management checks to all methods on this prefix.
             self.close_connection = True
             self.connection.settimeout(SOCKET_TIMEOUT)
             if reader is not None and not (reader.valid and reader.complete):
@@ -169,9 +173,11 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
             if auth and len(auth) == 1 and re.fullmatch(r'Bearer [a-f0-9]{64}', auth[0]):
                 return auth[0][7:]
 
-        def matches_credential(self):
-            token, bearer = self.current_token(), self.bearer()
-            return bearer is not None and hmac.compare_digest(bearer, token)
+        def check_upload_credential(self):
+            if not anonymous:
+                token, bearer = self.current_token(), self.bearer()
+                if bearer is None or not hmac.compare_digest(bearer, token):
+                    raise RequestError(401, 'Credential changed during upload')
 
         def denied(self, **headers):
             return self.result(401, {'error': 'Credential required'},
@@ -274,7 +280,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                 if hosts is None or hosts not in allowed:
                     raise RequestError(403, 'Unexpected Host')
                 bearer = None
-                if not proof:
+                if not (proof or anonymous):
                     token, bearer = self.current_token(), self.bearer()
                     if bearer is None or not hmac.compare_digest(bearer, token):
                         if shutdown_probe:
@@ -339,8 +345,7 @@ def management_handler(base: type[Handler], store, credential, *, host=None, pro
                     raise RequestError(400, 'Invalid project precondition')
                 if action is None:
                     spec, content = self.upload(length, project)
-                    if not self.matches_credential():
-                        raise RequestError(401, 'Credential changed during upload')
+                    self.check_upload_credential()
                     manifest = store._publish(spec, content, 'PrintBench management API', expected=expected)
                     return self.result(201, manifest)
                 version, state = store.set_archived(project, action == 'archive', expected)

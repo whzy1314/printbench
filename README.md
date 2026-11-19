@@ -35,24 +35,44 @@ For Helm CLI upgrades, use `helm upgrade RELEASE ./charts/printbench --reset-val
 
 ## Optional private management API
 
-Management is disabled unless explicitly configured. It uses `/manage/v1/` on the existing HTTP listener and shares the existing store and locks. Opt in with `serve --management-token-file FILE` or `PRINTBENCH_MANAGEMENT_TOKEN_FILE` (path only). Use synthetic credentials for isolated loopback tests. The server checks the actual Host and authenticates every management operation with the bearer before processing a body, including on direct requests. Forwarded headers never establish identity, authorization, or transport security. The old separate-listener settings must not be reused.
+Management is disabled unless explicitly configured. It uses `/manage/v1/` on the existing HTTP listener and shares the existing store and locks. All modes check the actual Host; forwarded headers never establish identity, authorization, or transport security. The old separate-listener settings must not be reused.
 
-Chart opt-in is `management: {tokenSecret: ...}`. It adds only a read-only Secret projection and path variable to the same Deployment, without changing listeners, routing or storage. `tokenSecret` must have key `token` (a dedicated, random 32-byte token encoded as 64 lowercase hex characters, with at most one trailing LF). Verify effective projected permissions: root:10001 `0440`; local client/server token files must be regular owner-only `0400` or `0600`. Missing, malformed, or unsafe credentials prevent enabled startup. The app rereads the token for each management request and before committing an upload. Never place credential contents in values, env vars, CLI arguments, logs, shell output or the browser.
+For bearer mode use `serve --management-token-file FILE` or `PRINTBENCH_MANAGEMENT_TOKEN_FILE` (path only), or set `management: {tokenSecret: ...}` in Helm. The chart adds only a read-only Secret projection and path variable to the same Deployment. `tokenSecret` must have key `token` (a dedicated, random 32-byte token encoded as 64 lowercase hex characters, with at most one trailing LF). Verify effective projected permissions: root:10001 `0440`; local client/server token files must be regular owner-only `0400` or `0600`. Missing, malformed, or unsafe credentials prevent enabled startup. The app checks the bearer before processing each management body, including on direct requests, and rechecks it after upload. Never place credential contents in values, env vars, CLI arguments, logs, shell output or the browser. Use synthetic credentials for isolated tests.
 
 Use the hosted CLI only with an approved, certificate-verified private HTTPS edge. **TLS at the edge does not protect the bearer on a plaintext backend hop: an observer there can capture and reuse it, including on the direct HTTP app path.** Independently verify the private transport/logging assumptions and revocation before activation. The edge must not log credential headers or bodies, cache management responses, or retry mutations. See [the bundled skill](skills/printbench/SKILL.md) for client commands. `python3 -m printbench.client --url ...` verifies HTTPS, never follows redirects, and attaches the bearer only to management calls. The browser remains credential-free.
 
-| Authenticated request | Effect |
+### Anonymous management for trusted private networks only
+
+Set `PRINTBENCH_MANAGEMENT_ANONYMOUS=1` when running `serve`, or set `management: {anonymous: true}` in Helm. Omit the environment variable or omit chart `management` to disable it (`management: {anonymous: false}` also disables it). Other environment values and non-boolean chart values are rejected. Do not combine `anonymous` with token, proof or shutdown probe settings. Helm adds only the opt-in environment variable, not a Secret or route.
+
+**Anyone who can reach the enabled listener and send the exact Host can manage the library**, including on direct backend paths. Restrict reachability to trusted clients before enabling it. Host checks are not authentication. Cross-origin browser writes still require preflight for the upload or conditional headers, and the server does not grant CORS access. A simple form POST lacks the required precondition. Ordinary browser/API reads are unchanged.
+
+Use the approved HTTPS origin with `--anonymous` before any management subcommand, instead of `--token-file`:
+
+```sh
+python3 -m printbench.client --url "$management_origin" --anonymous create --spec "$spec" --source "$source"
+python3 -m printbench.client --url "$management_origin" --anonymous state "$project"
+python3 -m printbench.client --url "$management_origin" --anonymous append --spec "$spec" --source "$source" --match "$etag"
+python3 -m printbench.client --url "$management_origin" --anonymous archive "$project" --match "$etag"
+python3 -m printbench.client --url "$management_origin" --anonymous restore "$project" --match "$etag"
+```
+
+Use a new revision ID for append. Set `etag` to the exact quoted value from a fresh `state` for each intended append, archive or restore; do not reuse a stale tag or blindly replay an uncertain write. Ordinary `list`, `get`, `history` and `download` still need neither flag. TLS verification remains mandatory for the hosted CLI.
+
+### Management protocol and rollback
+
+| Request in writer mode | Effect |
 | --- | --- |
 | `GET /manage/v1/projects/ID/state` | Current revision ID, archive flag and strong state `ETag`; no manifest or artifacts |
 | `PUT /manage/v1/projects/ID` with `If-None-Match: *` | Create with first immutable revision only |
 | Same `PUT` with the last observed `If-Match: "…"` | Append a new immutable revision only |
 | `POST /manage/v1/projects/ID/archive` or `/restore` with `If-Match` | Atomically change visibility without moving the current revision or rewriting history |
 
-The `PUT` frame is `Content-Type: application/octet-stream` with one exact decimal `Content-Length`: 4-byte big-endian JSON byte count, then UTF-8 JSON `{"spec": {...}, "sizes": [...]}`, then full artifact bytes in `spec.artifacts` order. JSON is limited to 1 MiB and combined artifacts to 64 MiB; malformed framing, unsafe filenames, encodings, duplicate JSON keys, chunked bodies and `Expect` are rejected. The local CLI publication limit is unchanged. State-only requests have no body. A stale precondition returns `412`, missing precondition `428`, duplicate revision or conflicting state `409`. No write is automatically retried. A lost response is ambiguous: re-read state and verify the exact revision, statuses and hashes; never refresh a precondition and replay a stale operation automatically. An archived project is absent from ordinary list, detail, history, revision and download/HEAD paths; the authenticated state endpoint exists for restore. Archiving is not recall of previously downloaded files or a read already in flight. No purge is provided.
+The `PUT` frame is `Content-Type: application/octet-stream` with one exact decimal `Content-Length`: 4-byte big-endian JSON byte count, then UTF-8 JSON `{"spec": {...}, "sizes": [...]}`, then full artifact bytes in `spec.artifacts` order. JSON is limited to 1 MiB and combined artifacts to 64 MiB; malformed framing, unsafe filenames, encodings, duplicate JSON keys, chunked bodies and `Expect` are rejected. The local CLI publication limit is unchanged. State-only requests have no body. A stale precondition returns `412`, missing precondition `428`, duplicate revision or conflicting state `409`. No write is automatically retried. A lost response is ambiguous: re-read state and verify the exact revision, statuses and hashes; never refresh a precondition and replay a stale operation automatically. An archived project is absent from ordinary list, detail, history, revision and download/HEAD paths; the management state endpoint exists for restore. Archiving is not recall of previously downloaded files or a read already in flight. No purge is provided.
 
 Reads do not wait for the writer lock: each project is read from one committed index snapshot and its immutable revision files. An overlapping read can finish from its earlier snapshot; requests started after archive commits cannot read the project. A list takes one snapshot per project, not a library-wide transaction. State ETags bind the complete committed index and project ID, including legacy indexes (not rewritten on read).
 
-Rollback: first close admission to all management writes (including direct backend paths; revoking protected token delivery can close new bearer admission) and pause local CLI writers. Drain admitted requests or prove their settlement, including reconciling ambiguous outcomes against the committed state; a quiet edge or a temporarily free writer lock alone is not settlement. Keep writes closed if settlement is unproven. Omit chart `management` and verify management dispatch is disabled on the existing listener. Keep the same claim, history, read route and an archive-aware reader; verify archived IDs still fail direct reads/downloads and are absent from the list. Never restore archived projects or install an archive-unaware binary as part of rollback.
+Rollback: first pause clients and local CLI writers and close off new management writes, including direct backend paths. For bearer mode use the revocation and receipt procedure below. For anonymous mode, SIGTERM or Ctrl+C stops accepting connections, closes the listener and waits for request threads to finish before exiting. Upload deadlines still apply; storage lock and I/O waits can outlast the supervisor's grace period. A forced stop is not proof of settlement. Reconcile ambiguous outcomes against committed state before proceeding; a quiet edge or temporarily free writer lock alone is not settlement. Restart read-only with the opt-in omitted (omit chart `management`) and verify management dispatch is disabled. Keep the same claim, history, read route and an archive-aware reader; verify archived IDs still fail direct reads/downloads and are absent from the list. Never restore archives or downgrade to an archive-unaware reader as part of rollback.
 
 ### Same-process writer shutdown evidence
 
@@ -113,7 +133,7 @@ Set `restore_dir` to an unused absolute path first. Compare the restored project
 
 ## Optional Hermes skill
 
-The standalone app does not need Hermes. For the [bundled skill](skills/printbench/SKILL.md), use Hermes in the **intended profile**. Check for an existing `printbench` skill (including disabled skills) with `hermes -p YOUR_PROFILE skills list`; do not overwrite it without separately reviewed authorization. Use the intended profile's native skill tools and verify readback with `skill_view(name="printbench")`; do not bypass profile controls. Supply the reviewed checkout, approved HTTPS origin and protected credential path separately. Skill installation does not enable writes, start a server or create a library.
+The standalone app does not need Hermes. For the [bundled skill](skills/printbench/SKILL.md), use Hermes in the **intended profile**. Check for an existing `printbench` skill (including disabled skills) with `hermes -p YOUR_PROFILE skills list`; do not overwrite it without separately reviewed authorization. Use the intended profile's native skill tools and verify readback with `skill_view(name="printbench")`; do not bypass profile controls. Supply the reviewed checkout, approved HTTPS origin and management mode separately; a protected credential path is needed only for bearer mode. Skill installation does not enable writes, start a server or create a library.
 
 ## Tests
 

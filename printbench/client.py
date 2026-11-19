@@ -23,9 +23,9 @@ def request(args, path, *, method='GET', headers=None, body=None, limit=MAX_JSON
             or re.search(r'[\x00-\x20\x7f\\?#]', args.url)):
         raise BenchError('Expected an approved HTTPS origin, without credentials, path, query or fragment')
     headers = {'Cache-Control': 'no-store', **(headers or {})}
-    if path.startswith(PREFIX):
+    if path.startswith(PREFIX) and not args.anonymous:
         if args.token_file is None:
-            raise BenchError('Management requires a protected credential file')
+            raise BenchError('Management requires a protected credential file or explicit --anonymous')
         try:
             token = read_token(args.token_file.absolute())
         except OSError:
@@ -67,7 +67,9 @@ def main():
     try:
         parser = Parser(description=__doc__)
         parser.add_argument('--url', required=True, help='approved HTTPS origin')
-        parser.add_argument('--token-file', type=Path, help='owner-only credential file (management only)')
+        access = parser.add_mutually_exclusive_group()
+        access.add_argument('--token-file', type=Path, help='owner-only credential file (management only)')
+        access.add_argument('--anonymous', action='store_true', help='explicit opt-in to anonymous management')
         parser.add_argument('--ca-file', help='optional approved CA bundle; TLS verification is mandatory')
         commands = parser.add_subparsers(dest='command', required=True)
         commands.add_parser('list')
